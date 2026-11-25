@@ -1,0 +1,24 @@
+{
+  "name": "queueforge-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "QueueForge control-plane API server",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.2",
+    "morgan": "^1.10.0",
+    "pg": "^8.13.1",
+    "pg-hstore": "^2.3.4",
+    "pino": "^9.6.0",
+    "sequelize": "^6.37.5",
+    "zod": "^3.24.1"
+  }
+}

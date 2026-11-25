@@ -1,0 +1,13 @@
+{
+  "name": "queueforge-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "QueueForge distributed job queue backend",
+  "scripts": {
+    "dev:api": "npm --prefix api run dev",
+    "dev:worker": "npm --prefix worker run dev",
+    "start:api": "npm --prefix api run start",
+    "start:worker": "npm --prefix worker run start"
+  }
+}

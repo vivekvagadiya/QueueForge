@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment variables (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Temp and OS artifacts
+tmp/
+temp/
+.DS_Store
+Thumbs.db
+.idea/
