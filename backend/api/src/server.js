@@ -1,3 +1,4 @@
+import os from 'node:os';
 import app from './app.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
@@ -8,8 +9,30 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 let isShuttingDown = false;
 
+const instanceMeta = {
+  pid: process.pid,
+  hostname: os.hostname(),
+  nodeVersion: process.version,
+  port: env.PORT,
+  databaseConfigured: Boolean(env.DATABASE_URL),
+  redisConfigured: Boolean(env.REDIS_URL),
+};
+
 const server = app.listen(env.PORT, () => {
-  logger.info({ port: env.PORT }, 'QueueForge API server started');
+  logger.info(instanceMeta, 'QueueForge API server started');
+  console.info(
+    [
+      '',
+      `[QueueForge API] Instance running (${env.NODE_ENV})`,
+      `  PID / Host : ${instanceMeta.pid} @ ${instanceMeta.hostname} (${instanceMeta.nodeVersion})`,
+      `  Server URL : http://localhost:${env.PORT}`,
+      `  Health URL : http://localhost:${env.PORT}/api/v1/health`,
+      `  CORS Origin: ${env.CORS_ORIGIN}`,
+      `  Database   : ${instanceMeta.databaseConfigured ? 'configured' : 'not configured'}`,
+      `  Redis      : ${instanceMeta.redisConfigured ? 'configured' : 'not configured'}`,
+      '',
+    ].join('\n')
+  );
 });
 
 server.on('error', (err) => {
@@ -24,6 +47,7 @@ const shutdown = async (signal, exitCode = 0) => {
   isShuttingDown = true;
 
   logger.info({ signal }, 'Shutting down QueueForge API server');
+  console.info(`[QueueForge API] Shutting down instance (pid=${process.pid}, signal=${signal})...`);
 
   const forceTimer = setTimeout(() => {
     logger.error('Forced API shutdown due to timeout');
@@ -41,6 +65,7 @@ const shutdown = async (signal, exitCode = 0) => {
 
     clearTimeout(forceTimer);
     logger.info('QueueForge API shutdown complete');
+    console.info(`[QueueForge API] Instance stopped (pid=${process.pid})`);
     process.exit(exitCode);
   } catch (err) {
     clearTimeout(forceTimer);
