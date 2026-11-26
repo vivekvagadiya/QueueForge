@@ -9,3 +9,14 @@ export class AppError extends Error {
     Error.captureStackTrace(this, this.constructor);
   }
 }
+
+export const badRequest = (message, code = 'BAD_REQUEST', details = null) =>
+  new AppError(message, 400, code, details);
+
+export const unauthorized = (message = 'Authentication required', code = 'UNAUTHORIZED') =>
+  new AppError(message, 401, code);
+
+export const notFound = (resource) => new AppError(`${resource} not found`, 404, 'NOT_FOUND');
+
+export const conflict = (message, code = 'CONFLICT', details = null) =>
+  new AppError(message, 409, code, details);

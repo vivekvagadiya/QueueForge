@@ -1,4 +1,5 @@
 import { ZodError } from 'zod';
+import { ConnectionError, ForeignKeyConstraintError, UniqueConstraintError } from 'sequelize';
 import { logger } from '../config/logger.js';
 
 export const errorHandler = (err, req, res, _next) => {
@@ -19,6 +20,23 @@ export const errorHandler = (err, req, res, _next) => {
     statusCode = 400;
     code = 'INVALID_JSON';
     message = 'Malformed JSON request body';
+  } else if (err.type === 'entity.too.large') {
+    statusCode = 413;
+    code = 'PAYLOAD_TOO_LARGE';
+    message = 'Request body is too large';
+  } else if (err instanceof UniqueConstraintError) {
+    // Services translate expected conflicts; this is the safety net for races.
+    statusCode = 409;
+    code = 'CONFLICT';
+    message = 'Resource already exists';
+  } else if (err instanceof ForeignKeyConstraintError) {
+    statusCode = 409;
+    code = 'CONFLICT';
+    message = 'Operation conflicts with related resources';
+  } else if (err instanceof ConnectionError) {
+    statusCode = 503;
+    code = 'SERVICE_UNAVAILABLE';
+    message = 'Database is unavailable';
   }
 
   const logPayload = {

@@ -16,7 +16,7 @@
 - [x] Five-table schema migrated and verified.
 - [ ] API job lifecycle integrated with Redis Streams and workers.
 
-**Immediate next step:** Sprint 1 — API modules, Zod validation, auth, and queue/job endpoints.
+**Immediate next step:** Sprint 2 — Redis Streams and the transactional outbox.
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -65,22 +65,44 @@ Keep `job_attempts.worker_id` nullable so an attempt can still be recorded when 
 **Goal:** Implement the control-plane API and persist queues/jobs without Redis.
 
 ### Tasks
-- [ ] Organize modules: config, database, models, repositories, services, controllers, routes, middleware, validators, and errors.
-- [ ] Add centralized error handling and request validation with Zod.
-- [ ] Implement queue create/list/get/update operations.
-- [ ] Implement job submission and job retrieval endpoints.
-- [ ] Validate queue ownership and job input before persistence.
-- [ ] Add pagination and status filtering.
-- [ ] Add idempotency-key support backed by a database uniqueness constraint.
-- [ ] Add authentication/authorization before exposing user-owned resources.
-- [ ] Write integration tests against a test PostgreSQL database.
+- [x] Organize modules: config, database, models, repositories, services, controllers, routes, middleware, validators, and errors.
+- [x] Add centralized error handling and request validation with Zod.
+- [x] Implement queue create/list/get/update operations.
+- [x] Implement job submission and job retrieval endpoints.
+- [x] Validate queue ownership and job input before persistence.
+- [x] Add pagination and status filtering.
+- [x] Add idempotency-key support backed by a database uniqueness constraint.
+- [x] Add authentication/authorization before exposing user-owned resources.
+- [x] Write integration tests against a test PostgreSQL database.
 
 ### Acceptance criteria
-- [ ] Queue and job CRUD flows work through HTTP.
-- [ ] Invalid requests return consistent validation errors.
-- [ ] A job cannot be submitted to a queue the caller does not own.
-- [ ] Duplicate idempotency keys do not create duplicate logical jobs.
-- [ ] API restart does not lose persisted jobs.
+- [x] Queue and job CRUD flows work through HTTP.
+- [x] Invalid requests return consistent validation errors.
+- [x] A job cannot be submitted to a queue the caller does not own.
+- [x] Duplicate idempotency keys do not create duplicate logical jobs.
+- [x] API restart does not lose persisted jobs.
+
+### API (Sprint 1)
+All routes are under `/api/v1`. Everything except `auth/register` and `auth/login` requires `Authorization: Bearer <token>`.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/auth/register` | `{ name, email, password }` → user + access token |
+| POST | `/auth/login` | `{ email, password }` → user + access token |
+| GET | `/auth/me` | Current user |
+| POST | `/queues` | `{ name, description?, concurrency?, defaultJobOptions?: { maxAttempts?, priority? } }` |
+| GET | `/queues` | `?page&limit&status=ACTIVE,PAUSED` |
+| GET / PATCH | `/queues/:queueId` | PATCH accepts any create field plus `status`; `defaultJobOptions` is replaced whole |
+| POST | `/queues/:queueId/jobs` | `{ name, payload?, priority?, maxAttempts?, delayMs? \| scheduledAt?, idempotencyKey? }`; the key may also be sent as the `Idempotency-Key` header |
+| GET | `/queues/:queueId/jobs` | `?page&limit&status=WAITING,SCHEDULED` |
+| GET | `/jobs/:jobId` | Job plus attempt history |
+
+Behavior notes:
+- Another user's queue or job returns `404`, the same as a missing one, so IDs don't reveal what exists.
+- Idempotency keys are unique per queue. A replay returns `200` with the original job and `Idempotent-Replayed: true`. Reusing a key with a different `name` or `payload` returns `409 IDEMPOTENCY_KEY_CONFLICT`.
+- `ARCHIVED` queues reject new jobs (`409`). `PAUSED` queues still accept them; pausing will only stop dispatch (Sprint 5).
+- Errors always have the shape `{ success: false, error: { code, message, details? } }`.
+- Tests: `npm test` runs the integration suite against `queueforge_test`, which is created automatically. Set `TEST_DATABASE_URL` to use a different database; its name must end in `_test`.
 
 ## Sprint 2 — Redis Streams and transactional outbox
 
@@ -204,11 +226,11 @@ Keep `job_attempts.worker_id` nullable so an attempt can still be recorded when 
 
 ## Recommended next-session checklist
 
-1. [ ] Set up the Sprint 1 module layout (repositories, services, controllers, validators).
-2. [ ] Add password hashing and JWT authentication for `users`.
-3. [ ] Implement queue create/list/get/update endpoints scoped to the caller.
-4. [ ] Implement job submission with idempotency keys, plus job retrieval with pagination and status filters.
-5. [ ] Add a test database and integration tests (including a migration up/down test for CI).
+1. [ ] Decide whether to add the `outbox_events` table (a deliberate schema extension), and write its migration.
+2. [ ] Write the job row and its outbox event in one transaction. With the insert inside a transaction, use `INSERT … ON CONFLICT` or a savepoint for idempotency races instead of catching the unique violation.
+3. [ ] Add Redis connection lifecycle, health check, and bounded retry.
+4. [ ] Build the outbox publisher process (`FOR UPDATE SKIP LOCKED` claim → `XADD` → mark published).
+5. [ ] Add a migration up/down test to the test suite for CI.
 
 ## Definition of done for each sprint
 
