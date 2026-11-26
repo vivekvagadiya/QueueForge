@@ -6,7 +6,12 @@
   "description": "QueueForge control-plane API server",
   "scripts": {
     "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "db:migrate": "node src/database/migrate.js up",
+    "db:migrate:undo": "node src/database/migrate.js down",
+    "db:migrate:undo:all": "node src/database/migrate.js down --to 0",
+    "db:migrate:pending": "node src/database/migrate.js pending",
+    "db:migrate:status": "node src/database/migrate.js executed"
   },
   "dependencies": {
     "cors": "^2.8.5",
