@@ -11,6 +11,23 @@ import { env } from '../config/env.js';
  */
 export const jobStreamKey = (queueId) => `${env.STREAM_PREFIX}:queue:${queueId}:jobs`;
 
+/**
+ * Creates the worker consumer group on a stream if missing. Starts at ID 0 so
+ * entries published before any worker existed are still delivered. MKSTREAM
+ * creates the stream for queues that have no jobs yet.
+ */
+export const ensureConsumerGroup = async (redis, streamKey, group) => {
+  try {
+    await redis.xgroup('CREATE', streamKey, group, '0', 'MKSTREAM');
+    return true;
+  } catch (err) {
+    if (String(err.message).includes('BUSYGROUP')) {
+      return false;
+    }
+    throw err;
+  }
+};
+
 /** Flat field/value list for XADD. Redis stream values are strings. */
 export const toStreamFields = (event) => [
   'eventId', event.id,

@@ -3,12 +3,7 @@ import os from 'node:os';
 import { isRedisReady } from '../config/redis.js';
 import { outboxRepository } from '../repositories/outbox.repository.js';
 import { jobStreamKey, toStreamFields } from '../streams/jobStream.js';
-
-/** Exponential backoff with full jitter: random in [delay/2, delay], capped. */
-export const retryDelayMs = (attempt, { baseMs, maxMs }) => {
-  const exp = Math.min(maxMs, baseMs * 2 ** Math.max(0, attempt - 1));
-  return Math.round(exp / 2 + Math.random() * (exp / 2));
-};
+import { retryDelayMs } from '../utils/backoff.js';
 
 export const createPublisherId = () =>
   `${os.hostname()}:${process.pid}:${crypto.randomBytes(4).toString('hex')}`;

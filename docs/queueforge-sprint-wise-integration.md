@@ -15,9 +15,9 @@
 - [x] Migration runner and first migration implemented.
 - [x] Five-table schema migrated and verified.
 - [x] Transactional outbox and publisher deliver jobs to Redis Streams.
-- [ ] Workers consume streams and execute jobs.
+- [x] Workers consume streams and execute jobs.
 
-**Immediate next step:** Sprint 3 — worker runtime and atomic job claiming.
+**Immediate next step:** Sprint 4 — retry release, lease renewal/heartbeat, and crash recovery.
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -124,7 +124,7 @@ Behavior notes:
 - [x] A committed job eventually produces a Redis Stream entry.
 - [x] Redis downtime does not lose a committed job (verified with a real Redis outage).
 - [x] Publisher restart resumes pending publication.
-- [ ] Duplicate stream events are safe to consume. *Publisher side is done: a duplicate carries the same `eventId` and `jobId`, and a stale publisher can't overwrite state. The consumer side (claim fails, so no second execution) is proven in Sprint 3.*
+- [x] Duplicate stream events are safe to consume. *Closed in Sprint 3: a duplicate entry fails the claim, so the handler doesn't run again, and the entry is acknowledged.*
 
 ### How it works (Sprint 2)
 - Submitting a `WAITING` job inserts the job and a `job.ready` row in `outbox_events` in one transaction. `SCHEDULED` jobs get their event when the scheduler releases them (Sprint 5).
@@ -139,21 +139,41 @@ Behavior notes:
 **Goal:** Execute handlers without allowing two workers to own the same job simultaneously.
 
 ### Tasks
-- [ ] Create a separately runnable worker process from the same codebase.
-- [ ] Define a job-handler registry and handler contract.
-- [ ] Consume Redis Stream entries with `XREADGROUP` and a consumer group.
-- [ ] Claim a job atomically in PostgreSQL before executing it.
-- [ ] Persist worker ownership and a lease/fencing token as part of the agreed schema evolution.
-- [ ] Create a `job_attempts` row in the same transaction as a successful claim.
-- [ ] Execute handlers outside the database transaction.
-- [ ] Persist success/failure with guarded updates using job ID, worker ID, and fencing token.
-- [ ] Call `XACK` only after the durable database outcome commits.
+- [x] Create a separately runnable worker process from the same codebase.
+- [x] Define a job-handler registry and handler contract.
+- [x] Consume Redis Stream entries with `XREADGROUP` and a consumer group.
+- [x] Claim a job atomically in PostgreSQL before executing it.
+- [x] Persist worker ownership and a lease/fencing token as part of the agreed schema evolution.
+- [x] Create a `job_attempts` row in the same transaction as a successful claim.
+- [x] Execute handlers outside the database transaction.
+- [x] Persist success/failure with guarded updates using job ID, worker ID, and fencing token.
+- [x] Call `XACK` only after the durable database outcome commits.
 
 ### Acceptance criteria
-- [ ] Two workers receiving the same event cannot execute the same eligible job concurrently.
-- [ ] A worker that fails to claim a job never executes its handler.
-- [ ] A database failure does not cause premature acknowledgement.
-- [ ] Delivery semantics are documented as at-least-once; handlers are expected to be idempotent.
+- [x] Two workers receiving the same event cannot execute the same eligible job concurrently.
+- [x] A worker that fails to claim a job never executes its handler.
+- [x] A database failure does not cause premature acknowledgement.
+- [x] Delivery semantics are documented as at-least-once; handlers are expected to be idempotent.
+
+### How it works (Sprint 3)
+- `npm run worker` registers the process in `workers`. That row's ID is both the lease owner (`jobs.locked_by`) and the consumer name (`worker:<id>`) in the `CONSUMER_GROUP`.
+- `WORKER_QUEUES=*` consumes every non-archived queue and picks up new queues every `WORKER_QUEUE_REFRESH_MS`. Consumer groups start at ID `0`, so jobs published before any worker existed are still delivered.
+- For each entry the worker: claims the job (`WAITING → ACTIVE`, `lease_version + 1`, `attempts_made + 1`, new `RUNNING` attempt row, all in one transaction) → runs the handler with no transaction open → saves the outcome. That write only applies if job ID, `locked_by`, `lease_version` and `status = ACTIVE` all still match → commits → `XACK`.
+- **Handler contract** (see `src/worker/handlerRegistry.js`): `async ({ job, signal, logger }) => result`. The result must be JSON-serializable. Throw `NonRetryableError` to fail permanently. Register handlers in `src/worker/handlers/index.js`. Built-in demo handlers: `system.echo`, `system.sleep`, `system.fail`.
+- **Delivery is at-least-once.** A handler can run more than once, for example after a crash between a side effect and saving the result. Handlers must be idempotent; pass `job.id` as the idempotency key to external providers.
+- **Outcomes:**
+  - Success → `COMPLETED`.
+  - Retryable error with attempts left → `RETRYING`, with `scheduled_at` set by exponential backoff with jitter.
+  - Last allowed attempt fails → `DEAD`.
+  - `NonRetryableError`, unknown job name (`HANDLER_NOT_FOUND`), or a result that can't be serialized → `FAILED`.
+- **Entries that can't be claimed are acknowledged without running anything.** That covers a finished job, an `ACTIVE`, `SCHEDULED` or `RETRYING` job, an unknown job, or a malformed entry. **Event policy:** every transition into `WAITING` must create a fresh `job.ready` outbox event. The scheduler, retry release and recovery in Sprints 4–5 must follow this rule.
+- Database errors during the claim, the inspection, or the outcome write leave the entry **unacknowledged**.
+- **Backpressure:** a worker reads only when it has a free slot. `XREADGROUP` `COUNT` applies per stream, so extra entries from one multi-stream read wait in a small local backlog, at most one per stream.
+- **Shutdown:** the worker is marked `DRAINING`, stops reading, and finishes in-flight and already-delivered entries within `WORKER_SHUTDOWN_GRACE_MS`. It then aborts the rest, which stay `ACTIVE` and unacknowledged for lease recovery, and is marked `STOPPED`.
+- **Known gaps until Sprint 4:**
+  - `RETRYING` jobs aren't released back to `WAITING` yet.
+  - Leases aren't renewed, so they expire after `WORKER_LEASE_MS`. Nothing reclaims expired leases yet, so long jobs still finish.
+  - Entries left pending by a crashed worker aren't reclaimed (`XAUTOCLAIM`).
 
 ## Sprint 4 — Retry policy, leases, heartbeat, and recovery
 
@@ -236,11 +256,11 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Worker process entry point (`npm run worker`) that registers itself in `workers` and sends a heartbeat.
-2. [ ] Handler registry and contract (`name` → async handler with payload and cancellation signal).
-3. [ ] Create consumer groups (`XGROUP CREATE … MKSTREAM`) and run an `XREADGROUP` loop on a dedicated blocking Redis client.
-4. [ ] Atomic claim (`WAITING → ACTIVE`, increment `lease_version`, insert a `job_attempts` row) in one transaction.
-5. [ ] Persist the outcome with fencing-token checks, then `XACK`. Test duplicate stream entries end to end; this closes Sprint 2's last criterion.
+1. [ ] Retry release: move due `RETRYING` jobs to `WAITING` and insert a `job.ready` outbox event in the same transaction (the event policy).
+2. [ ] Job lease renewal while a handler runs, fenced on `lease_version`. Abort the handler cooperatively if renewal finds the lease lost.
+3. [ ] Worker heartbeat (`workers.last_heartbeat_at`) and marking workers `UNHEALTHY`.
+4. [ ] Recovery process: expired `ACTIVE` leases → attempt `INTERRUPTED` → `RETRYING`/`DEAD`, using guarded updates.
+5. [ ] `XAUTOCLAIM` for entries left pending by dead consumers, then crash-window tests (before claim, during execution, after commit before `XACK`, during recovery).
 
 ## Definition of done for each sprint
 

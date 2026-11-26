@@ -9,6 +9,8 @@
     "start": "node src/server.js",
     "publisher": "node src/publisher.js",
     "dev:publisher": "node --watch src/publisher.js",
+    "worker": "node src/worker.js",
+    "dev:worker": "node --watch src/worker.js",
     "db:migrate": "node src/database/migrate.js up",
     "db:migrate:undo": "node src/database/migrate.js down",
     "db:migrate:undo:all": "node src/database/migrate.js down --to 0",

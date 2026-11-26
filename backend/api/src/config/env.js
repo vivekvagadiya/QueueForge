@@ -29,6 +29,23 @@ const envSchema = z.object({
   OUTBOX_CLAIM_TIMEOUT_MS: z.coerce.number().int().min(1000).default(30_000),
   OUTBOX_RETRY_BASE_MS: z.coerce.number().int().min(1).default(1000),
   OUTBOX_RETRY_MAX_MS: z.coerce.number().int().min(1).default(60_000),
+
+  // Workers
+  WORKER_NAME: z.string().trim().min(1).max(100).optional(),
+  CONSUMER_GROUP: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9_.:-]+$/)
+    .default('queueforge-workers'),
+  // Comma-separated queue IDs, or "*" for every non-archived queue.
+  WORKER_QUEUES: z.string().trim().min(1).default('*'),
+  WORKER_QUEUE_REFRESH_MS: z.coerce.number().int().min(100).default(10_000),
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(1000).default(5),
+  WORKER_BLOCK_MS: z.coerce.number().int().min(10).max(60_000).default(2000),
+  WORKER_LEASE_MS: z.coerce.number().int().min(1000).default(30_000),
+  WORKER_SHUTDOWN_GRACE_MS: z.coerce.number().int().min(0).default(20_000),
+  JOB_RETRY_BASE_MS: z.coerce.number().int().min(1).default(1000),
+  JOB_RETRY_MAX_MS: z.coerce.number().int().min(1).default(300_000),
 });
 
 const parsed = envSchema.safeParse(process.env);
