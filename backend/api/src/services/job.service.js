@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
-import { UniqueConstraintError } from 'sequelize';
+import { getDatabase } from '../config/database.js';
 import { jobRepository } from '../repositories/job.repository.js';
+import { outboxRepository } from '../repositories/outbox.repository.js';
 import { badRequest, conflict, notFound } from '../utils/AppError.js';
 import { getOwnedQueue } from './queue.service.js';
 import { paginationMeta, serializeJob } from './serializers.js';
@@ -69,29 +70,39 @@ export const jobService = {
     const defaults = queue.defaultJobOptions ?? {};
     const { status, scheduledAt } = resolveSchedule(input, new Date());
 
-    try {
-      const job = await jobRepository.create({
-        queueId,
-        name: input.name,
-        payload: input.payload,
-        status,
-        scheduledAt,
-        priority: input.priority ?? defaults.priority ?? DEFAULT_PRIORITY,
-        maxAttempts: input.maxAttempts ?? defaults.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
-        idempotencyKey,
-      });
-      return { job: serializeJob(job), created: true };
-    } catch (err) {
-      // Two concurrent submissions with the same key: the unique index lets
-      // exactly one insert win; the loser returns the winner's job.
-      if (idempotencyKey && err instanceof UniqueConstraintError) {
-        const existing = await jobRepository.findByIdempotencyKey({ queueId, idempotencyKey });
-        if (existing) {
-          return assertSameRequest(existing, input);
-        }
+    // The job and its job.ready outbox event commit together or not at all, so
+    // a committed job can never miss its notification (ADR-004). SCHEDULED jobs
+    // get their event later, when the scheduler releases them (Sprint 5).
+    const job = await getDatabase().transaction(async (transaction) => {
+      const inserted = await jobRepository.insertUnlessDuplicateKey(
+        {
+          queueId,
+          name: input.name,
+          payload: input.payload,
+          status,
+          scheduledAt,
+          priority: input.priority ?? defaults.priority ?? DEFAULT_PRIORITY,
+          maxAttempts: input.maxAttempts ?? defaults.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+          idempotencyKey,
+        },
+        { transaction }
+      );
+      if (inserted && inserted.status === 'WAITING') {
+        await outboxRepository.createJobReady(inserted, { transaction });
       }
-      throw err;
+      return inserted;
+    });
+
+    if (job) {
+      return { job: serializeJob(job), created: true };
     }
+
+    // A concurrent submission with the same key won the insert; return its job.
+    const existing = await jobRepository.findByIdempotencyKey({ queueId, idempotencyKey });
+    if (!existing) {
+      throw new Error('Idempotency conflict reported but no existing job was found');
+    }
+    return assertSameRequest(existing, input);
   },
 
   async list({ userId, queueId, page, limit, status }) {

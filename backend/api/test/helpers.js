@@ -2,12 +2,37 @@ import { Sequelize } from 'sequelize';
 import request from 'supertest';
 import app from '../src/app.js';
 import { closeDatabase, getDatabase } from '../src/config/database.js';
+import { createRedisClient } from '../src/config/redis.js';
 import { createMigrator } from '../src/database/umzug.js';
 import { initModels } from '../src/models/index.js';
 
 export { app, request };
 
-const TABLES = ['job_attempts', 'jobs', 'workers', 'queues', 'users'];
+const TABLES = ['outbox_events', 'job_attempts', 'jobs', 'workers', 'queues', 'users'];
+
+/** Real Redis client for tests; resolves once connected. */
+export const connectTestRedis = async () => {
+  const client = createRedisClient('test');
+  if (client.status !== 'ready') {
+    await new Promise((resolve, reject) => {
+      client.once('ready', resolve);
+      client.once('error', reject);
+    });
+  }
+  return client;
+};
+
+/** Deletes all streams under the test prefix (never touches dev keys). */
+export const clearTestStreams = async (client) => {
+  const prefix = process.env.STREAM_PREFIX;
+  if (!prefix.endsWith('-test')) throw new Error(`Refusing to clear non-test prefix ${prefix}`);
+  let cursor = '0';
+  do {
+    const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}:*`, 'COUNT', 500);
+    if (keys.length) await client.del(...keys);
+    cursor = next;
+  } while (cursor !== '0');
+};
 
 /** Creates the test database if it does not exist yet. */
 const ensureTestDatabase = async () => {

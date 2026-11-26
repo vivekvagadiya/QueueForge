@@ -10,6 +10,8 @@ dotenv.config();
 process.env.NODE_ENV = 'test';
 process.env.LOG_LEVEL = process.env.TEST_LOG_LEVEL ?? 'silent';
 process.env.JWT_SECRET ??= 'test-only-jwt-secret-with-at-least-32-characters';
+// Isolates test streams from dev streams in the same Redis instance.
+process.env.STREAM_PREFIX = 'queueforge-test';
 
 const deriveTestUrl = (url) => {
   if (!url) {

@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "publisher": "node src/publisher.js",
+    "dev:publisher": "node --watch src/publisher.js",
     "db:migrate": "node src/database/migrate.js up",
     "db:migrate:undo": "node src/database/migrate.js down",
     "db:migrate:undo:all": "node src/database/migrate.js down --to 0",

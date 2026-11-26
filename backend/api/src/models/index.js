@@ -3,8 +3,9 @@ import { Queue } from './queue.model.js';
 import { Job } from './job.model.js';
 import { Worker } from './worker.model.js';
 import { JobAttempt } from './jobAttempt.model.js';
+import { OutboxEvent } from './outboxEvent.model.js';
 
-const models = { User, Queue, Job, Worker, JobAttempt };
+const models = { User, Queue, Job, Worker, JobAttempt, OutboxEvent };
 let initialized = false;
 
 /**
@@ -23,4 +24,4 @@ export const initModels = (sequelize) => {
   return models;
 };
 
-export { User, Queue, Job, Worker, JobAttempt };
+export { User, Queue, Job, Worker, JobAttempt, OutboxEvent };

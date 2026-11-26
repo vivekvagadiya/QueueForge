@@ -13,6 +13,22 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_EXPIRES_IN: z.string().trim().min(1).default('1h'),
   JWT_ISSUER: z.string().trim().min(1).default('queueforge-api'),
+
+  // Redis Streams
+  STREAM_PREFIX: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9_.:-]+$/)
+    .default('queueforge'),
+
+  // Outbox publisher
+  OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).default(1000),
+  OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(1000).default(100),
+  // A PROCESSING claim older than this is treated as abandoned and re-claimed.
+  // Must comfortably exceed the time to publish one batch.
+  OUTBOX_CLAIM_TIMEOUT_MS: z.coerce.number().int().min(1000).default(30_000),
+  OUTBOX_RETRY_BASE_MS: z.coerce.number().int().min(1).default(1000),
+  OUTBOX_RETRY_MAX_MS: z.coerce.number().int().min(1).default(60_000),
 });
 
 const parsed = envSchema.safeParse(process.env);

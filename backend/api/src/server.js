@@ -2,9 +2,8 @@ import os from 'node:os';
 import app from './app.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
-import { getDatabase, closeDatabase } from './config/database.js';
-import { createMigrator } from './database/umzug.js';
-import { initModels } from './models/index.js';
+import { closeDatabase } from './config/database.js';
+import { initDatabase } from './database/bootstrap.js';
 import { closeRedisClient } from './config/redis.js';
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -20,42 +19,7 @@ const instanceMeta = {
   redisConfigured: Boolean(env.REDIS_URL),
 };
 
-/**
- * Verifies PostgreSQL is reachable and the schema is fully migrated.
- * Exits with a clear message instead of serving requests against a bad database.
- */
-const initDatabase = async () => {
-  const sequelize = getDatabase();
-
-  try {
-    await sequelize.authenticate();
-  } catch (err) {
-    logger.fatal({ err: err.original ?? err }, 'Cannot connect to PostgreSQL');
-    console.error(
-      `[QueueForge API] Startup aborted: cannot connect to PostgreSQL (${err.original?.code ?? err.message}). ` +
-        'Check DATABASE_URL and that the database server is running.'
-    );
-    await closeDatabase();
-    process.exit(1);
-  }
-
-  const pending = await createMigrator(sequelize).pending();
-  if (pending.length > 0) {
-    const names = pending.map((m) => m.name);
-    logger.fatal({ pending: names }, 'Database has pending migrations');
-    console.error(
-      `[QueueForge API] Startup aborted: ${pending.length} pending migration(s): ${names.join(', ')}. ` +
-        'Run `npm run db:migrate`.'
-    );
-    await closeDatabase();
-    process.exit(1);
-  }
-
-  initModels(sequelize);
-  logger.info('PostgreSQL connected and schema up to date');
-};
-
-await initDatabase();
+await initDatabase('API');
 
 const server = app.listen(env.PORT, () => {
   logger.info(instanceMeta, 'QueueForge API server started');

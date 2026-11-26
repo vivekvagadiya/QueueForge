@@ -14,9 +14,10 @@
 - [x] Umzug installed.
 - [x] Migration runner and first migration implemented.
 - [x] Five-table schema migrated and verified.
-- [ ] API job lifecycle integrated with Redis Streams and workers.
+- [x] Transactional outbox and publisher deliver jobs to Redis Streams.
+- [ ] Workers consume streams and execute jobs.
 
-**Immediate next step:** Sprint 2 — Redis Streams and the transactional outbox.
+**Immediate next step:** Sprint 3 — worker runtime and atomic job claiming.
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -34,6 +35,7 @@
 | `jobs` | Persisted job payload, status, schedule, and result | Belongs to `queues`; has many attempts |
 | `workers` | Worker process registration and heartbeat | Has many job attempts |
 | `job_attempts` | Per-execution history, result, and error details | Belongs to `jobs`; optionally references `workers` |
+| `outbox_events` | Transactional outbox (added deliberately in Sprint 2) | `aggregate_id` references a job; no FK, so events outlive job cleanup |
 
 Keep `job_attempts.worker_id` nullable so an attempt can still be recorded when worker attribution is unavailable (for example, during certain recovery paths). Use UUID identifiers, PostgreSQL-native types such as `JSONB` where appropriate, timestamps, foreign keys, unique constraints, and indexes matching the agreed schema.
 
@@ -109,20 +111,28 @@ Behavior notes:
 **Goal:** Deliver job-ready events reliably after the database transaction commits.
 
 ### Tasks
-- [ ] Add Redis client configuration, connection lifecycle, health checks, and bounded retry behavior.
-- [ ] Add an `outbox_events` table only if/when the MVP schema is deliberately extended; document and migrate that schema change rather than silently adding it.
-- [ ] Persist job creation and its outbox event in one PostgreSQL transaction.
-- [ ] Implement an outbox publisher that safely claims pending events.
-- [ ] Publish lightweight job-ready events with `XADD`.
-- [ ] Mark events published only after Redis confirms the write.
-- [ ] Make duplicate publication safe; a crash between `XADD` and marking published can produce duplicates.
-- [ ] Add structured logs and retry/backoff for publisher failures.
+- [x] Add Redis client configuration, connection lifecycle, health checks, and bounded retry behavior.
+- [x] Add an `outbox_events` table only if/when the MVP schema is deliberately extended; document and migrate that schema change rather than silently adding it.
+- [x] Persist job creation and its outbox event in one PostgreSQL transaction.
+- [x] Implement an outbox publisher that safely claims pending events.
+- [x] Publish lightweight job-ready events with `XADD`.
+- [x] Mark events published only after Redis confirms the write.
+- [x] Make duplicate publication safe; a crash between `XADD` and marking published can produce duplicates.
+- [x] Add structured logs and retry/backoff for publisher failures.
 
 ### Acceptance criteria
-- [ ] A committed job eventually produces a Redis Stream entry.
-- [ ] Redis downtime does not lose a committed job.
-- [ ] Publisher restart resumes pending publication.
-- [ ] Duplicate stream events are safe to consume.
+- [x] A committed job eventually produces a Redis Stream entry.
+- [x] Redis downtime does not lose a committed job (verified with a real Redis outage).
+- [x] Publisher restart resumes pending publication.
+- [ ] Duplicate stream events are safe to consume. *Publisher side is done: a duplicate carries the same `eventId` and `jobId`, and a stale publisher can't overwrite state. The consumer side (claim fails, so no second execution) is proven in Sprint 3.*
+
+### How it works (Sprint 2)
+- Submitting a `WAITING` job inserts the job and a `job.ready` row in `outbox_events` in one transaction. `SCHEDULED` jobs get their event when the scheduler releases them (Sprint 5).
+- Run the publisher with `npm run publisher`; several instances can run at once. Each cycle claims due events with `FOR UPDATE SKIP LOCKED`, sends each one with `XADD`, then marks the successful ones `PUBLISHED`. Failed events go back to `PENDING` with exponential backoff and jitter.
+- While Redis is unreachable the publisher claims nothing, so attempt counts don't climb. A claim older than `OUTBOX_CLAIM_TIMEOUT_MS` is treated as abandoned by a crashed publisher and taken over. Every update after a claim checks `locked_by`.
+- Streams: `<STREAM_PREFIX>:queue:<queueId>:jobs`, with entry fields `eventId`, `eventType`, `jobId`, `queueId`. The job payload is never copied to Redis.
+- Streams are not trimmed yet. Choose a trimming policy once consumers acknowledge entries (Sprint 3/4), so unconsumed entries aren't dropped.
+- Published outbox rows are kept; cleanup belongs to the retention work in Sprint 5.
 
 ## Sprint 3 — Worker runtime and atomic job claiming
 
@@ -226,11 +236,11 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Decide whether to add the `outbox_events` table (a deliberate schema extension), and write its migration.
-2. [ ] Write the job row and its outbox event in one transaction. With the insert inside a transaction, use `INSERT … ON CONFLICT` or a savepoint for idempotency races instead of catching the unique violation.
-3. [ ] Add Redis connection lifecycle, health check, and bounded retry.
-4. [ ] Build the outbox publisher process (`FOR UPDATE SKIP LOCKED` claim → `XADD` → mark published).
-5. [ ] Add a migration up/down test to the test suite for CI.
+1. [ ] Worker process entry point (`npm run worker`) that registers itself in `workers` and sends a heartbeat.
+2. [ ] Handler registry and contract (`name` → async handler with payload and cancellation signal).
+3. [ ] Create consumer groups (`XGROUP CREATE … MKSTREAM`) and run an `XREADGROUP` loop on a dedicated blocking Redis client.
+4. [ ] Atomic claim (`WAITING → ACTIVE`, increment `lease_version`, insert a `job_attempts` row) in one transaction.
+5. [ ] Persist the outcome with fencing-token checks, then `XACK`. Test duplicate stream entries end to end; this closes Sprint 2's last criterion.
 
 ## Definition of done for each sprint
 
