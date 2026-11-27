@@ -10,16 +10,21 @@ import { errorCode, isRetryable } from './errors.js';
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'DEAD', 'CANCELLED']);
 
+const entryKey = (streamKey, entryId) => `${streamKey}|${entryId}`;
+
 /**
  * Worker runtime. Consumes job.ready entries from per-queue Redis streams via a
  * consumer group, and executes jobs it has atomically claimed in PostgreSQL.
  *
- * Per entry:  claim in PG -> run handler (outside any transaction)
- *             -> persist outcome fenced by lease_version -> commit -> XACK.
+ * Per entry:  claim in PG -> run handler (outside any transaction, lease renewed
+ *             in the background) -> persist outcome fenced by lease_version
+ *             -> commit -> XACK.
  *
  * A Redis delivery never grants execution rights; only the PG claim does.
  * XACK happens only after the durable outcome commits, so a crash at any point
- * leaves the entry pending for redelivery/recovery (Sprint 4) rather than lost.
+ * leaves the entry pending. Pending entries idle for too long are taken over
+ * with XAUTOCLAIM by any worker, and expired leases are recovered by the
+ * recovery process.
  *
  * Dependencies are injected so tests can drive single entries and simulate failures.
  */
@@ -34,26 +39,43 @@ export class Worker {
     workers = workerRepository,
   }) {
     this.reader = reader; // dedicated connection for blocking XREADGROUP
-    this.commands = commands; // XACK, XGROUP; never blocked by the reader
+    this.commands = commands; // XACK, XGROUP, XAUTOCLAIM; never blocked by the reader
     this.registry = registry;
     this.baseLogger = logger;
     this.logger = logger;
-    this.config = config;
+    this.config = {
+      leaseRenewMs: Math.max(100, Math.floor(config.leaseMs / 3)),
+      heartbeatMs: 5000,
+      pendingIdleMs: 60_000,
+      pendingCheckMs: 15_000,
+      ...config,
+    };
+    if (this.config.leaseRenewMs >= this.config.leaseMs) {
+      throw new Error('leaseRenewMs must be shorter than leaseMs');
+    }
     this.repository = repository;
     this.workers = workers;
 
     this.workerId = null;
     this.consumerName = null;
+    this.status = 'STARTING';
     this.streamKeys = [];
     this.queuesRefreshedAt = 0;
+    this.pendingCheckedAt = 0;
+    this.pendingCursors = new Map(); // XAUTOCLAIM cursor per stream
     this.running = false;
     this.waitingForRedis = false;
     this.loopPromise = null;
+    this.heartbeatTimer = null;
+    this.heartbeatPromise = null;
+    this.heartbeatFailing = false;
     this.inflight = new Set();
     // Entries delivered to this consumer but not started yet. XREADGROUP's COUNT
     // is per stream, so a multi-stream read can return more entries than free
     // slots; the excess waits here (at most one batch, bounded by stream count).
     this.backlog = [];
+    // Entries in the backlog or in flight, so XAUTOCLAIM doesn't hand us our own work twice.
+    this.activeEntries = new Set();
     this.abortController = new AbortController();
     this.stopSignal = new Promise((resolve) => {
       this.signalStop = resolve;
@@ -71,6 +93,7 @@ export class Worker {
     });
     this.workerId = row.id;
     this.consumerName = `worker:${row.id}`;
+    this.status = 'RUNNING';
     this.logger = this.baseLogger.child({ workerId: row.id });
     return row.id;
   }
@@ -111,6 +134,7 @@ export class Worker {
     // 1. Claim. A database error means we don't know the job's state: leave the
     //    entry pending so it is redelivered, and never run the handler.
     let claim;
+    const claimStartedAt = Date.now();
     try {
       claim = await this.repository.claim({
         jobId: entry.jobId,
@@ -127,15 +151,24 @@ export class Worker {
       return this.handleUnclaimable(streamKey, entryId, entry, log);
     }
 
-    // 2. Execute outside any transaction.
+    // 2. Execute outside any transaction, renewing the lease while it runs.
     const jobLog = log.child({ attempt: claim.attempt, leaseVersion: claim.leaseVersion });
-    const execution = await this.execute(claim, jobLog);
+    const lease = this.holdLease(claim, jobLog, claimStartedAt);
+    let execution;
+    try {
+      execution = await this.execute(claim, jobLog, lease.signal);
+    } finally {
+      lease.release();
+    }
 
-    if (execution.abandoned) {
-      // Shutdown grace expired mid-run. Don't record a misleading outcome: the
-      // job stays ACTIVE and its lease expires for recovery (Sprint 4).
-      jobLog.warn('Handler interrupted by shutdown; leaving job for lease recovery');
-      return { outcome: 'pending:abandoned', acked: false };
+    if (execution.abandoned === 'lease-lost') {
+      // Someone else owns the job now (recovery or a new claim), and they
+      // emit a new event if it needs to run again. This entry is redundant.
+      jobLog.warn('Handler aborted after the lease was lost; outcome discarded');
+      return this.finish(streamKey, entryId, 'lease-lost', jobLog);
+    }
+    if (execution.abandoned === 'shutdown') {
+      return this.releaseInterrupted(streamKey, entryId, claim, jobLog);
     }
 
     // 3. Persist the outcome with the fencing token, then 4. acknowledge.
@@ -176,8 +209,9 @@ export class Worker {
     }
     if (state.status === 'ACTIVE' || state.status === 'SCHEDULED' || state.status === 'RETRYING') {
       // Event policy: every transition into WAITING emits a fresh job.ready
-      // event. An ACTIVE job is owned by someone else; SCHEDULED/RETRYING jobs
-      // will get a new event when released. This entry is redundant either way.
+      // event. An ACTIVE job is owned by someone else (and recovered via its
+      // lease if they die); SCHEDULED/RETRYING jobs get a new event when
+      // released. This entry is redundant either way.
       log.debug({ status: state.status }, 'Job not claimable now; a new event will follow if needed');
       return this.finish(streamKey, entryId, `discarded:${state.status.toLowerCase()}`, log);
     }
@@ -187,7 +221,50 @@ export class Worker {
     return { outcome: 'pending:race', acked: false };
   }
 
-  async execute(claim, log) {
+  /**
+   * Renews the job lease every `leaseRenewMs` while the handler runs. The
+   * returned signal aborts on shutdown, or when the lease is lost: either
+   * another owner took the job over, or renewal kept failing until the lease
+   * had certainly expired (recovery may hand the job out again at any moment).
+   */
+  holdLease(claim, log, claimStartedAt) {
+    const controller = new AbortController();
+    let lastRenewedAt = claimStartedAt; // conservative: the lease started no later than this
+    let renewing = false;
+    let released = false;
+
+    const lose = (reason) => {
+      if (controller.signal.aborted || released) return;
+      log.warn({ reason }, 'Job lease lost; aborting handler');
+      controller.abort(new Error(`Job lease lost (${reason})`));
+    };
+
+    const timer = setInterval(async () => {
+      if (renewing || released || controller.signal.aborted) return;
+      renewing = true;
+      const attemptedAt = Date.now();
+      try {
+        const renewed = await this.repository.renewLease(claim, { leaseMs: this.config.leaseMs });
+        if (renewed) lastRenewedAt = attemptedAt;
+        else lose('taken-over');
+      } catch (err) {
+        log.warn({ err }, 'Lease renewal failed');
+        if (Date.now() - lastRenewedAt >= this.config.leaseMs) lose('expired');
+      } finally {
+        renewing = false;
+      }
+    }, this.config.leaseRenewMs);
+
+    return {
+      signal: AbortSignal.any([this.abortController.signal, controller.signal]),
+      release: () => {
+        released = true;
+        clearInterval(timer);
+      },
+    };
+  }
+
+  async execute(claim, log, signal = this.abortController.signal) {
     const handler = this.registry.get(claim.name);
     const started = Date.now();
 
@@ -209,12 +286,12 @@ export class Worker {
           attempt: claim.attempt,
           maxAttempts: claim.maxAttempts,
         },
-        signal: this.abortController.signal,
+        signal,
         logger: log,
       });
     } catch (err) {
-      if (this.abortController.signal.aborted) {
-        return { abandoned: true };
+      if (signal.aborted) {
+        return { abandoned: this.abortController.signal.aborted ? 'shutdown' : 'lease-lost' };
       }
       const error = err instanceof Error ? err : new Error(String(err));
       return { ok: false, error, durationMs: Date.now() - started };
@@ -234,13 +311,14 @@ export class Worker {
   }
 
   /** Applies the retry policy: RETRYING with backoff, or FAILED / DEAD. */
-  async persistFailure(claim, err) {
+  async persistFailure(claim, err, { attemptStatus = 'FAILED' } = {}) {
     let nextStatus = 'RETRYING';
     if (!isRetryable(err)) nextStatus = 'FAILED';
     else if (claim.attempt >= claim.maxAttempts) nextStatus = 'DEAD';
 
     const applied = await this.repository.fail(claim, {
       nextStatus,
+      attemptStatus,
       retryDelayMs:
         nextStatus === 'RETRYING'
           ? retryDelayMs(claim.attempt, { baseMs: this.config.retryBaseMs, maxMs: this.config.retryMaxMs })
@@ -248,6 +326,28 @@ export class Worker {
       error: { code: errorCode(err), message: err.message || String(err), stack: err.stack },
     });
     return { outcome: nextStatus.toLowerCase(), applied };
+  }
+
+  /**
+   * The handler was aborted by shutdown and has returned, so nothing is running
+   * the job any more: hand it back now (attempt INTERRUPTED, job RETRYING or
+   * DEAD) instead of making it wait for the lease to expire. If that write
+   * fails, the entry stays pending and lease recovery handles the job.
+   */
+  async releaseInterrupted(streamKey, entryId, claim, log) {
+    const err = new Error('Worker shut down before the attempt finished');
+    err.code = 'WORKER_SHUTDOWN';
+    try {
+      const { outcome, applied } = await this.persistFailure(claim, err, { attemptStatus: 'INTERRUPTED' });
+      if (!applied) {
+        return this.finish(streamKey, entryId, 'fenced', log);
+      }
+      log.warn({ outcome }, 'Handler interrupted by shutdown; attempt recorded as INTERRUPTED');
+      return this.finish(streamKey, entryId, `interrupted:${outcome}`, log);
+    } catch (e) {
+      log.error({ err: e }, 'Could not release interrupted job; it will be recovered when its lease expires');
+      return { outcome: 'pending:abandoned', acked: false };
+    }
   }
 
   /** XACK after the durable state is committed. An ack failure only causes a harmless redelivery. */
@@ -262,12 +362,57 @@ export class Worker {
   }
 
   // ---------------------------------------------------------------------------
+  // Stale pending entries (XAUTOCLAIM)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Takes over entries that have been pending longer than `pendingIdleMs` in
+   * any consumer of the group: a worker that crashed after reading an entry,
+   * or an entry left pending after a database error. Processing them is safe:
+   * the PG claim decides whether anything runs. Returns the number queued.
+   */
+  async claimStalePending(limit) {
+    this.pendingCheckedAt = Date.now();
+    let queued = 0;
+    for (const streamKey of this.streamKeys) {
+      if (queued >= limit) break;
+      const cursor = this.pendingCursors.get(streamKey) ?? '0-0';
+      const [next, entries] = await this.commands.xautoclaim(
+        streamKey, this.config.group, this.consumerName,
+        this.config.pendingIdleMs, cursor, 'COUNT', limit - queued
+      );
+      this.pendingCursors.set(streamKey, next);
+
+      for (const [entryId, fields] of entries) {
+        if (this.activeEntries.has(entryKey(streamKey, entryId))) continue; // ours, already in progress
+        if (!fields) {
+          // Redis 6.2 returns deleted entries as nil; nothing to process.
+          await this.commands.xack(streamKey, this.config.group, entryId);
+          continue;
+        }
+        this.enqueue({ streamKey, entryId, fields });
+        queued += 1;
+      }
+    }
+    if (queued > 0) {
+      this.logger.info({ entries: queued }, 'Took over stale pending stream entries');
+    }
+    return queued;
+  }
+
+  // ---------------------------------------------------------------------------
   // Consume loop and lifecycle
   // ---------------------------------------------------------------------------
+
+  enqueue(item) {
+    this.activeEntries.add(entryKey(item.streamKey, item.entryId));
+    this.backlog.push(item);
+  }
 
   startEntry({ streamKey, entryId, fields }) {
     const task = this.processEntry(streamKey, entryId, fields).finally(() => {
       this.inflight.delete(task);
+      this.activeEntries.delete(entryKey(streamKey, entryId));
     });
     this.inflight.add(task);
   }
@@ -283,10 +428,34 @@ export class Worker {
     }
   }
 
+  /** Records liveness. Failures are logged once per outage; leases keep jobs safe meanwhile. */
+  async heartbeat() {
+    if (this.heartbeatPromise) return this.heartbeatPromise;
+    this.heartbeatPromise = (async () => {
+      try {
+        const alive = await this.workers.heartbeat(this.workerId, {
+          status: this.status,
+          activeJobs: this.inflight.size,
+        });
+        if (!alive) this.logger.warn('Heartbeat matched no live worker row');
+        if (this.heartbeatFailing) this.logger.info('Heartbeat recovered');
+        this.heartbeatFailing = false;
+      } catch (err) {
+        if (!this.heartbeatFailing) this.logger.warn({ err }, 'Heartbeat failed');
+        this.heartbeatFailing = true;
+      } finally {
+        this.heartbeatPromise = null;
+      }
+    })();
+    return this.heartbeatPromise;
+  }
+
   async start() {
     if (this.running) return;
     if (!this.workerId) await this.register();
     this.running = true;
+    this.status = 'RUNNING';
+    this.heartbeatTimer = setInterval(() => this.heartbeat(), this.config.heartbeatMs);
     this.logger.info(
       { concurrency: this.config.concurrency, handlers: this.registry.names() },
       'Worker started'
@@ -329,6 +498,10 @@ export class Worker {
         }
 
         const free = this.config.concurrency - this.inflight.size;
+        if (Date.now() - this.pendingCheckedAt >= this.config.pendingCheckMs) {
+          if ((await this.claimStalePending(free)) > 0) continue;
+        }
+
         const perStream = Math.max(1, Math.ceil(free / this.streamKeys.length));
         const response = await this.reader.xreadgroup(
           'GROUP', this.config.group, this.consumerName,
@@ -340,7 +513,7 @@ export class Worker {
 
         for (const [streamKey, entries] of response ?? []) {
           for (const [entryId, fields] of entries) {
-            this.backlog.push({ streamKey, entryId, fields });
+            this.enqueue({ streamKey, entryId, fields });
           }
         }
       } catch (err) {
@@ -348,6 +521,7 @@ export class Worker {
         if (String(err.message).includes('NOGROUP')) {
           this.queuesRefreshedAt = 0; // stream or group was deleted; recreate on next pass
           this.streamKeys = [];
+          this.pendingCursors.clear();
         }
         consecutiveErrors += 1;
         const wait = retryDelayMs(consecutiveErrors, { baseMs: 200, maxMs: 5000 });
@@ -359,11 +533,14 @@ export class Worker {
 
   /**
    * Graceful shutdown: stop reading, let in-flight jobs finish within the grace
-   * period, then abort the rest (they are left ACTIVE for lease recovery).
+   * period, then abort the rest. Aborted jobs are handed back immediately
+   * (attempt INTERRUPTED -> RETRYING/DEAD); if that fails, lease recovery does it.
+   * Heartbeats and lease renewal continue while draining.
    */
   async stop() {
     if (!this.running) return;
     this.running = false;
+    this.status = 'DRAINING';
     this.signalStop();
     this.logger.info({ inflight: this.inflight.size }, 'Worker draining');
     await this.workers.setStatus(this.workerId, 'DRAINING').catch((err) =>
@@ -390,6 +567,9 @@ export class Worker {
       await Promise.allSettled([...this.inflight]);
     }
 
+    clearInterval(this.heartbeatTimer);
+    await this.heartbeatPromise;
+    this.status = 'STOPPED';
     await this.workers.setStatus(this.workerId, 'STOPPED').catch((err) =>
       this.logger.warn({ err }, 'Could not mark worker STOPPED')
     );

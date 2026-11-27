@@ -44,8 +44,35 @@ const envSchema = z.object({
   WORKER_BLOCK_MS: z.coerce.number().int().min(10).max(60_000).default(2000),
   WORKER_LEASE_MS: z.coerce.number().int().min(1000).default(30_000),
   WORKER_SHUTDOWN_GRACE_MS: z.coerce.number().int().min(0).default(20_000),
+  // How often a running job's lease is extended. Defaults to WORKER_LEASE_MS / 3.
+  WORKER_LEASE_RENEW_MS: z.coerce.number().int().min(100).optional(),
+  WORKER_HEARTBEAT_MS: z.coerce.number().int().min(100).default(5000),
+  // Stream entries pending longer than this in any consumer are taken over (XAUTOCLAIM).
+  WORKER_PENDING_IDLE_MS: z.coerce.number().int().min(1000).default(60_000),
+  WORKER_PENDING_CHECK_MS: z.coerce.number().int().min(100).default(15_000),
   JOB_RETRY_BASE_MS: z.coerce.number().int().min(1).default(1000),
   JOB_RETRY_MAX_MS: z.coerce.number().int().min(1).default(300_000),
+
+  // Recovery process
+  RECOVERY_INTERVAL_MS: z.coerce.number().int().min(100).default(1000),
+  RECOVERY_BATCH_SIZE: z.coerce.number().int().min(1).max(1000).default(100),
+  // A worker with no heartbeat for this long is marked UNHEALTHY.
+  WORKER_HEARTBEAT_TIMEOUT_MS: z.coerce.number().int().min(1000).default(30_000),
+}).superRefine((cfg, ctx) => {
+  if (cfg.WORKER_LEASE_RENEW_MS !== undefined && cfg.WORKER_LEASE_RENEW_MS >= cfg.WORKER_LEASE_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['WORKER_LEASE_RENEW_MS'],
+      message: 'must be shorter than WORKER_LEASE_MS',
+    });
+  }
+  if (cfg.WORKER_HEARTBEAT_MS >= cfg.WORKER_HEARTBEAT_TIMEOUT_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['WORKER_HEARTBEAT_MS'],
+      message: 'must be shorter than WORKER_HEARTBEAT_TIMEOUT_MS',
+    });
+  }
 });
 
 const parsed = envSchema.safeParse(process.env);

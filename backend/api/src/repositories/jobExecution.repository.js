@@ -121,10 +121,28 @@ export const jobExecutionRepository = {
     }),
 
   /**
-   * ACTIVE -> RETRYING (with scheduled_at = NOW() + retryDelayMs), FAILED, or DEAD.
-   * Returns false if the claim was fenced out.
+   * Extends the lease of a job this worker still owns. Returns false when the
+   * job was recovered or re-claimed (lease lost): the caller must stop working on it.
+   * Renewal is allowed after expiry as long as nobody has taken the job over.
    */
-  fail: (claim, { nextStatus, retryDelayMs, error }) =>
+  async renewLease(claim, { leaseMs }) {
+    const rows = await select(
+      `UPDATE jobs
+       SET lock_expires_at = NOW() + make_interval(secs => $4::double precision / 1000),
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'ACTIVE' AND locked_by = $2 AND lease_version = $3
+       RETURNING id`,
+      [claim.jobId, claim.workerId, claim.leaseVersion, leaseMs]
+    );
+    return rows.length === 1;
+  },
+
+  /**
+   * ACTIVE -> RETRYING (with scheduled_at = NOW() + retryDelayMs), FAILED, or DEAD.
+   * `attemptStatus` is FAILED for handler errors and INTERRUPTED when the
+   * worker gave the job up (shutdown). Returns false if the claim was fenced out.
+   */
+  fail: (claim, { nextStatus, retryDelayMs, error, attemptStatus = 'FAILED' }) =>
     getDatabase().transaction(async (transaction) => {
       const lastError = {
         code: error.code,
@@ -161,7 +179,7 @@ export const jobExecutionRepository = {
 
       await select(
         `UPDATE job_attempts
-         SET status = 'FAILED',
+         SET status = $6::text,
              finished_at = NOW(),
              duration_ms = GREATEST(0, ROUND(EXTRACT(EPOCH FROM NOW() - started_at) * 1000))::int,
              error_code = $3,
@@ -176,6 +194,7 @@ export const jobExecutionRepository = {
           error.code,
           error.message.slice(0, ERROR_MESSAGE_MAX),
           error.stack ? error.stack.slice(0, ERROR_STACK_MAX) : null,
+          attemptStatus,
         ],
         transaction
       );

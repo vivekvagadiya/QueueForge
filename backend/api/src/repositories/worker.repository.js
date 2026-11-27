@@ -26,6 +26,25 @@ export const workerRepository = {
   },
 
   /**
+   * Liveness signal. Also restores the worker's own status if recovery marked
+   * it UNHEALTHY during a pause. Never revives a STOPPED worker.
+   * Returns false if the row is gone or STOPPED.
+   */
+  async heartbeat(workerId, { status, activeJobs }) {
+    const rows = await getDatabase().query(
+      `UPDATE workers
+       SET last_heartbeat_at = NOW(),
+           status = $2::text,
+           active_jobs = $3,
+           updated_at = NOW()
+       WHERE id = $1 AND status <> 'STOPPED'
+       RETURNING id`,
+      { bind: [workerId, status, activeJobs], type: QueryTypes.SELECT }
+    );
+    return rows.length === 1;
+  },
+
+  /**
    * System-level queue discovery for workers configured with WORKER_QUEUES="*".
    * Deliberately not user-scoped: workers serve every tenant.
    */

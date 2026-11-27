@@ -11,6 +11,8 @@
     "dev:publisher": "node --watch src/publisher.js",
     "worker": "node src/worker.js",
     "dev:worker": "node --watch src/worker.js",
+    "recovery": "node src/recovery.js",
+    "dev:recovery": "node --watch src/recovery.js",
     "db:migrate": "node src/database/migrate.js up",
     "db:migrate:undo": "node src/database/migrate.js down",
     "db:migrate:undo:all": "node src/database/migrate.js down --to 0",

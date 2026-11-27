@@ -16,8 +16,9 @@
 - [x] Five-table schema migrated and verified.
 - [x] Transactional outbox and publisher deliver jobs to Redis Streams.
 - [x] Workers consume streams and execute jobs.
+- [x] Leases, heartbeat, retry release, and crash recovery.
 
-**Immediate next step:** Sprint 4 — retry release, lease renewal/heartbeat, and crash recovery.
+**Immediate next step:** Sprint 5 — scheduled job release, queue pause/resume, cancellation, and concurrency limits.
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -169,33 +170,50 @@ Behavior notes:
 - **Entries that can't be claimed are acknowledged without running anything.** That covers a finished job, an `ACTIVE`, `SCHEDULED` or `RETRYING` job, an unknown job, or a malformed entry. **Event policy:** every transition into `WAITING` must create a fresh `job.ready` outbox event. The scheduler, retry release and recovery in Sprints 4–5 must follow this rule.
 - Database errors during the claim, the inspection, or the outcome write leave the entry **unacknowledged**.
 - **Backpressure:** a worker reads only when it has a free slot. `XREADGROUP` `COUNT` applies per stream, so extra entries from one multi-stream read wait in a small local backlog, at most one per stream.
-- **Shutdown:** the worker is marked `DRAINING`, stops reading, and finishes in-flight and already-delivered entries within `WORKER_SHUTDOWN_GRACE_MS`. It then aborts the rest, which stay `ACTIVE` and unacknowledged for lease recovery, and is marked `STOPPED`.
-- **Known gaps until Sprint 4:**
-  - `RETRYING` jobs aren't released back to `WAITING` yet.
-  - Leases aren't renewed, so they expire after `WORKER_LEASE_MS`. Nothing reclaims expired leases yet, so long jobs still finish.
-  - Entries left pending by a crashed worker aren't reclaimed (`XAUTOCLAIM`).
+- **Shutdown:** the worker is marked `DRAINING`, stops reading, and finishes in-flight and already-delivered entries within `WORKER_SHUTDOWN_GRACE_MS`. It then aborts the rest and is marked `STOPPED`. *(Sprint 4: aborted jobs are now handed back immediately; see below.)*
 
 ## Sprint 4 — Retry policy, leases, heartbeat, and recovery
 
 **Goal:** Recover from worker crashes and transient handler failures.
 
 ### Tasks
-- [ ] Add configurable maximum attempts and retryable/non-retryable error classification.
-- [ ] Implement exponential backoff with jitter.
-- [ ] Add job lease renewal using PostgreSQL time.
-- [ ] Reject state updates from workers with stale ownership/fencing tokens.
-- [ ] Implement worker heartbeat and worker status transitions.
-- [ ] Recover jobs whose execution leases have expired.
-- [ ] Preserve interrupted attempt history and transition jobs to retry or terminal state.
-- [ ] Handle stale Redis pending entries with `XPENDING` / `XAUTOCLAIM` where appropriate.
-- [ ] Add graceful worker shutdown and bounded draining.
-- [ ] Test crash windows: before claim, during execution, after DB completion but before `XACK`, and during recovery.
+- [x] Add configurable maximum attempts and retryable/non-retryable error classification. *(Sprint 3: per-job `maxAttempts` with a queue default; `NonRetryableError`.)*
+- [x] Implement exponential backoff with jitter.
+- [x] Add job lease renewal using PostgreSQL time.
+- [x] Reject state updates from workers with stale ownership/fencing tokens.
+- [x] Implement worker heartbeat and worker status transitions.
+- [x] Recover jobs whose execution leases have expired.
+- [x] Preserve interrupted attempt history and transition jobs to retry or terminal state.
+- [x] Handle stale Redis pending entries with `XPENDING` / `XAUTOCLAIM` where appropriate.
+- [x] Add graceful worker shutdown and bounded draining.
+- [x] Test crash windows: before claim, during execution, after DB completion but before `XACK`, and during recovery.
 
 ### Acceptance criteria
-- [ ] Expired jobs are recovered without stale workers overwriting newer state.
-- [ ] Attempt history is retained.
-- [ ] Retry exhaustion reaches a terminal state.
-- [ ] Shutdown stops new consumption and handles in-flight work safely.
+- [x] Expired jobs are recovered without stale workers overwriting newer state.
+- [x] Attempt history is retained.
+- [x] Retry exhaustion reaches a terminal state.
+- [x] Shutdown stops new consumption and handles in-flight work safely.
+
+### How it works (Sprint 4)
+- **New process:** `npm run recovery` (PostgreSQL only; several instances are safe). Every `RECOVERY_INTERVAL_MS` it runs three steps, each claiming rows with `FOR UPDATE SKIP LOCKED` and re-checking the condition in the `UPDATE`:
+  1. **Expired leases:** an `ACTIVE` job whose `lock_expires_at` has passed gets its `RUNNING` attempt marked `INTERRUPTED` (`LEASE_EXPIRED`), then goes to `RETRYING` with backoff, or to `DEAD` if that was its last attempt. This is one statement, so the job and its attempt change together. The interrupted attempt counts toward `max_attempts`, so a job that crashes its worker every time eventually stops.
+  2. **Retry release:** due `RETRYING` jobs become `WAITING`, and a `job.ready` outbox event is inserted in the same transaction (event policy).
+  3. **Worker health:** workers with no heartbeat for `WORKER_HEARTBEAT_TIMEOUT_MS` are marked `UNHEALTHY`. This is informational only; leases are what keep jobs safe. A worker that comes back resets its own status on its next heartbeat. `STOPPED` workers are never changed.
+- **Lease renewal:** while a handler runs, the worker extends `lock_expires_at` every `WORKER_LEASE_RENEW_MS` (default: a third of the lease). The renewal is fenced on `locked_by` + `lease_version`. The handler's `signal` is aborted if renewal finds another owner, or if renewal keeps failing until the lease has certainly expired. The outcome is then discarded and the entry acknowledged, because the new owner is responsible. **Handlers that run long must honour `signal`.**
+- **Fencing:** after recovery, the old worker's complete, fail and renew calls all match zero rows, because the job is no longer `ACTIVE` under its `locked_by`/`lease_version`. A worker may still finish after its lease expired if nobody has taken the job over yet.
+- **Stale pending entries:** every `WORKER_PENDING_CHECK_MS`, a worker with free slots runs `XAUTOCLAIM` for entries idle longer than `WORKER_PENDING_IDLE_MS` in any consumer, then processes them normally. The PostgreSQL claim still decides whether anything runs. This covers:
+  - a crash after reading but before claiming (the job is still `WAITING`, so it runs)
+  - a crash after the outcome commit but before `XACK` (the job is terminal, so the entry is discarded)
+  - entries left pending by database errors
+
+  Taking over an entry whose job is still `ACTIVE` with a live worker is harmless: it is acknowledged as redundant.
+- **Heartbeat:** every `WORKER_HEARTBEAT_MS` the worker updates `last_heartbeat_at`, `active_jobs` and its own status (`RUNNING` / `DRAINING`). Heartbeats continue while draining.
+- **Shutdown:** handlers aborted at the end of the grace period have actually returned. Their job is therefore handed back at once: the attempt becomes `INTERRUPTED` (`WORKER_SHUTDOWN`) and the job goes to `RETRYING`/`DEAD` with a fenced write, and the entry is acknowledged. If that write fails, the job stays `ACTIVE` and lease recovery handles it.
+- Crash windows covered by `test/recovery.test.js`: before claim, during execution, after the DB outcome but before `XACK`, recovery racing a finishing worker, concurrent recovery instances, renewal loss, and retry exhaustion. A real `taskkill /F` of a worker mid-job was also verified end to end.
+- **Known limits:**
+  - Dead consumers are never removed from the consumer group (`XGROUP DELCONSUMER`).
+  - Streams and published outbox rows are not trimmed yet (Sprint 5 retention).
+  - `SCHEDULED` jobs are still not released (Sprint 5 scheduler; it should live in the recovery process and follow the same event policy).
 
 ## Sprint 5 — Scheduling and queue controls
 
@@ -256,11 +274,11 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Retry release: move due `RETRYING` jobs to `WAITING` and insert a `job.ready` outbox event in the same transaction (the event policy).
-2. [ ] Job lease renewal while a handler runs, fenced on `lease_version`. Abort the handler cooperatively if renewal finds the lease lost.
-3. [ ] Worker heartbeat (`workers.last_heartbeat_at`) and marking workers `UNHEALTHY`.
-4. [ ] Recovery process: expired `ACTIVE` leases → attempt `INTERRUPTED` → `RETRYING`/`DEAD`, using guarded updates.
-5. [ ] `XAUTOCLAIM` for entries left pending by dead consumers, then crash-window tests (before claim, during execution, after commit before `XACK`, during recovery).
+1. [ ] Scheduler step in the recovery process: due `SCHEDULED` jobs → `WAITING` + `job.ready` event in one transaction.
+2. [ ] Queue pause/resume: paused queues keep accepting jobs but are not dispatched. Decide whether that is enforced at claim time or by holding events back.
+3. [ ] Cancellation: `WAITING`/`SCHEDULED`/`RETRYING` jobs cancel directly. `ACTIVE` jobs cancel cooperatively through the handler `signal`, and are only reported as cancelled once the handler has stopped.
+4. [ ] Queue-level concurrency limits across worker processes (`queues.concurrency`).
+5. [ ] Retention: trim streams and delete old published outbox rows, completed jobs and attempts. Consider `XGROUP DELCONSUMER` for long-dead consumers that have no pending entries.
 
 ## Definition of done for each sprint
 

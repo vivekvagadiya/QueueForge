@@ -31,6 +31,10 @@ const config = {
   concurrency: env.WORKER_CONCURRENCY,
   blockMs: env.WORKER_BLOCK_MS,
   leaseMs: env.WORKER_LEASE_MS,
+  leaseRenewMs: env.WORKER_LEASE_RENEW_MS ?? Math.floor(env.WORKER_LEASE_MS / 3),
+  heartbeatMs: env.WORKER_HEARTBEAT_MS,
+  pendingIdleMs: env.WORKER_PENDING_IDLE_MS,
+  pendingCheckMs: env.WORKER_PENDING_CHECK_MS,
   shutdownGraceMs: env.WORKER_SHUTDOWN_GRACE_MS,
   retryBaseMs: env.JOB_RETRY_BASE_MS,
   retryMaxMs: env.JOB_RETRY_MAX_MS,
@@ -57,7 +61,7 @@ const shutdown = async (signal, exitCode = 0) => {
 
   // Hard stop if handlers ignore the abort signal.
   const forceTimer = setTimeout(() => {
-    logger.error('Forced worker exit; unfinished jobs will be recovered when their leases expire');
+    logger.error('Forced worker exit; unfinished jobs will be recovered when their leases expire (npm run recovery)');
     process.exit(1);
   }, config.shutdownGraceMs + 10_000);
   forceTimer.unref();

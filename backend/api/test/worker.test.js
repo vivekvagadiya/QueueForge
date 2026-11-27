@@ -440,16 +440,41 @@ describe('worker loop', () => {
     assert.equal(await pendingCount(), 0);
   });
 
-  test('jobs still running when the grace period ends are left ACTIVE and unacknowledged', async () => {
+  test('jobs aborted when the grace period ends are handed back as INTERRUPTED, not completed or failed', async () => {
     const worker = await makeWorker({ config: { shutdownGraceMs: 50 } });
+    await worker.start();
+    const job = await submit({ name: 'test.slow', payload: { ms: 10_000 }, maxAttempts: 3 });
+    await publishAll();
+    await waitFor(async () => (await jobRow(job.id)).status === 'ACTIVE');
+
+    await worker.stop();
+    const row = await jobRow(job.id);
+    assert.equal(row.status, 'RETRYING');
+    assert.equal(row.locked_by, null);
+    assert.equal(row.last_error.code, 'WORKER_SHUTDOWN');
+    const [attempt] = await attemptRows(job.id);
+    assert.equal(attempt.status, 'INTERRUPTED');
+    assert.equal(attempt.error_code, 'WORKER_SHUTDOWN');
+    assert.equal(await pendingCount(), 0, 'retry release will emit a new event');
+  });
+
+  test('if handing an aborted job back fails, it stays ACTIVE and its entry pending for lease recovery', async () => {
+    const worker = await makeWorker({
+      config: { shutdownGraceMs: 50 },
+      repository: {
+        ...jobExecutionRepository,
+        fail: async () => {
+          throw new Error('connection terminated');
+        },
+      },
+    });
     await worker.start();
     const job = await submit({ name: 'test.slow', payload: { ms: 10_000 } });
     await publishAll();
     await waitFor(async () => (await jobRow(job.id)).status === 'ACTIVE');
 
     await worker.stop();
-    const row = await jobRow(job.id);
-    assert.equal(row.status, 'ACTIVE', 'not falsely completed or failed');
+    assert.equal((await jobRow(job.id)).status, 'ACTIVE');
     assert.equal((await attemptRows(job.id))[0].status, 'RUNNING');
     assert.equal(await pendingCount(), 1);
   });
