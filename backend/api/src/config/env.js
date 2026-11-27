@@ -115,7 +115,11 @@ const envSchema = z.object({
   }
 });
 
-const parsed = envSchema.safeParse(process.env);
+// An empty value means "not set", so the default applies. Docker Compose
+// passes unset optional variables (e.g. METRICS_TOKEN: ${METRICS_TOKEN:-}) as "".
+const definedEnv = Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== ''));
+
+const parsed = envSchema.safeParse(definedEnv);
 
 if (!parsed.success) {
   const details = parsed.error.issues

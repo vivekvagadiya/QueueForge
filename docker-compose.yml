@@ -1,3 +1,42 @@
+# QueueForge services.
+#
+#   docker compose up -d                        Redis only (local development:
+#                                               run the API/worker with npm and
+#                                               your own PostgreSQL)
+#   docker compose --profile full up -d --build The whole stack: PostgreSQL,
+#                                               Redis, migrations, API, publisher,
+#                                               recovery, workers, dashboard
+#
+# Settings come from ./.env (copy .env.example). See docs/operations.md.
+
+x-backend: &backend
+  build: ./backend/api
+  image: queueforge-api:local
+  restart: unless-stopped
+  profiles: [full]
+  environment: &backend-env
+    NODE_ENV: production
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    DATABASE_URL: postgresql://queueforge:${POSTGRES_PASSWORD:-queueforge}@postgres:5432/queueforge
+    REDIS_URL: redis://redis:6379
+    # Required, at least 32 characters. The processes refuse to start without it.
+    JWT_SECRET: ${JWT_SECRET:-}
+    CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+    METRICS_TOKEN: ${METRICS_TOKEN:-}
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+# Readiness probe for the publisher, worker and recovery ops servers (OPS_PORT).
+x-ops-healthcheck: &ops-healthcheck
+  test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9464/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
 services:
   redis:
     image: redis:7-alpine
@@ -14,5 +53,93 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: postgres:17-alpine
+    profiles: [full]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: queueforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queueforge}
+      POSTGRES_DB: queueforge
+    # 5433 on the host by default, so it doesn't clash with a local PostgreSQL.
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queueforge -d queueforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Applies pending migrations, then exits. Every other backend service waits
+  # for it, and refuses to start if migrations are still pending.
+  migrate:
+    <<: *backend
+    restart: "no"
+    command: ["node", "src/database/migrate.js", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    command: ["node", "src/server.js"]
+    ports:
+      - "${API_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/v1/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  publisher:
+    <<: *backend
+    command: ["node", "src/publisher.js"]
+    environment:
+      <<: *backend-env
+      OPS_PORT: 9464
+    healthcheck: *ops-healthcheck
+
+  recovery:
+    <<: *backend
+    command: ["node", "src/recovery.js"]
+    environment:
+      <<: *backend-env
+      OPS_PORT: 9464
+    healthcheck: *ops-healthcheck
+
+  worker:
+    <<: *backend
+    command: ["node", "src/worker.js"]
+    environment:
+      <<: *backend-env
+      OPS_PORT: 9464
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    # Longer than WORKER_SHUTDOWN_GRACE_MS (20 s): running jobs finish or are
+    # handed back before Docker kills the container.
+    stop_grace_period: 35s
+    healthcheck: *ops-healthcheck
+
+  frontend:
+    build: ./frontend
+    image: queueforge-frontend:local
+    profiles: [full]
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
 volumes:
   redis_data:
+  pg_data:

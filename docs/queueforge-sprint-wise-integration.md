@@ -21,7 +21,9 @@
 - [x] React dashboard with real-time updates (Sprint 6).
 - [x] Structured logs with correlation IDs, Prometheus metrics, and health/readiness for every process (Sprint 7A).
 
-**Immediate next step:** Sprint 7B: testing, load testing and query tuning.
+**Immediate next step:** demonstrate Sprint 7C (Compose stack, first CI run). Sprint 7B (tests, load tests, query tuning) was skipped and is still open.
+
+Operations guide (setup, environment variables, deployment, backup/restore, runbooks): [operations.md](operations.md).
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -465,20 +467,79 @@ Prometheus format via prom-client. Every process labels its metrics with `role` 
 - The cluster snapshot queries have not been run through `EXPLAIN`; that is Sprint 7B.
 
 ### Sprint 7B — Testing, Load Testing & Query Tuning
+> **Skipped for now** (decided before 7C). Still open; see the next-session checklist.
+
 - [ ] Add unit, integration, end-to-end, race, and fault-injection tests (including Sprint 6B/6C coverage when requested).
 - [ ] Load-test throughput, latency, recovery time, and database connection usage.
 - [ ] Inspect critical queries with `EXPLAIN (ANALYZE, BUFFERS)` and tune indexes from measured plans.
 
 ### Sprint 7C — Docker Compose, CI & Production Runbooks
-- [ ] Add Docker Compose services for API, publisher, recovery (scheduler), workers, frontend, PostgreSQL, and Redis.
-- [ ] Add CI checks for linting, tests, and migration validation against a fresh database.
-- [ ] Document environment variables, setup, migrations, deployment, backup/restore, and recovery runbooks.
+- [x] Add Docker Compose services for API, publisher, recovery (scheduler), workers, frontend, PostgreSQL, and Redis.
+- [x] Add CI checks for linting, tests, and migration validation against a fresh database.
+- [x] Document environment variables, setup, migrations, deployment, backup/restore, and recovery runbooks.
+
+#### How it works (Sprint 7C)
+
+**Docker Compose** (`docker-compose.yml`)
+- `docker compose up -d` still starts Redis only, for local development. The full stack is in the `full` profile: `docker compose --profile full up -d --build`.
+- Settings come from the root `.env` (`.env.example`). `JWT_SECRET` is required.
+- **Services:**
+  - `postgres` 17: host port 5433, so it doesn't clash with a local server.
+  - `redis` 7.
+  - `migrate`: one-shot; every backend service waits for it to complete.
+  - `api`.
+  - `publisher`, `recovery`.
+  - `worker`: `WORKER_REPLICAS`, 2 by default.
+  - `frontend`: nginx on port 8080.
+- **Health checks:** each backend container is checked through its 7A readiness endpoint. The publisher, worker and recovery containers serve it on `OPS_PORT` 9464.
+- **Shutdown:** workers get `stop_grace_period: 35s`, which is longer than the 20 s handler grace.
+- **Backend image** (`backend/api/Dockerfile`): one image for all roles, selected by `command`.
+  - Built on `node:24-bookworm-slim`, so argon2's prebuilt binary is used and no compiler is needed.
+  - Production dependencies only; runs as the `node` user.
+  - Node runs as PID 1, so SIGTERM reaches the shutdown handlers.
+- **Frontend image** (`frontend/Dockerfile`, `frontend/nginx.conf`): a Vite build served by nginx.
+  - nginx proxies `/api` and `/socket.io` (with WebSocket upgrade) to `api:4000`, so the dashboard uses `/api/v1` from the same origin.
+  - nginx passes on the caller's `X-Request-Id`, or generates one, so the correlation ID starts at the edge.
+  - Client-side routes fall back to `index.html`, and hashed assets are cached as immutable.
+- **Settings change:** `env.js` now treats an empty variable as unset. Compose passes unset optional settings, such as `METRICS_TOKEN`, as empty strings.
+- **Git:** a root `.gitignore` keeps the root `.env` out of git.
+
+**CI** (`.github/workflows/ci.yml`, on pushes to `main` and on pull requests)
+- **Backend job**, with PostgreSQL 17 and Redis 7 service containers:
+  1. `npm run check:syntax`: `node --check` on every file. The backend has no ESLint yet.
+  2. Migrations applied to the fresh, empty database.
+  3. A full rollback (`db:migrate:undo:all`), then a re-apply.
+  4. `npm test`. CI runs the whole suite; the CLAUDE.md limit on running tests applies only to local agent sessions.
+- **Frontend job:** `npm run lint`, `npm test` (Vitest) and `npm run build`.
+- **Docker job:** `docker compose --profile full config` and `build`.
+
+**Docs:** `docs/operations.md` covers:
+- every environment variable;
+- setup in Docker and for local development;
+- migrations and deployment, with process table, probes, rollout order, shutdown and a security checklist;
+- PostgreSQL backup and restore;
+- recovery runbooks:
+  - waiting jobs that never start;
+  - growing publisher lag;
+  - Redis data lost (with the re-announce SQL);
+  - jobs stuck ACTIVE;
+  - unhealthy workers;
+  - DEAD and FAILED jobs;
+  - database outages;
+  - Redis outages.
+
+**Not verified yet**
+- Per CLAUDE.md, nothing was run apart from `node --check`. Specifically:
+  - the images have not been built;
+  - the stack has not been started;
+  - the CI workflow has not run.
+- The first push or pull request will exercise CI. Run `docker compose --profile full up -d --build` locally to confirm the stack starts.
 
 ### Acceptance criteria
-- [ ] A clean environment can be started from documented instructions.
-- [ ] CI passes against a fresh database.
-- [ ] Failure and load-test results are recorded.
-- [ ] Deployment and recovery procedures are reproducible.
+- [ ] A clean environment can be started from documented instructions. *(Documented; not yet demonstrated.)*
+- [ ] CI passes against a fresh database. *(Workflow added; not yet run.)*
+- [ ] Failure and load-test results are recorded. *(Sprint 7B, skipped.)*
+- [ ] Deployment and recovery procedures are reproducible. *(Documented in `docs/operations.md`; not yet rehearsed.)*
 
 ---
 
@@ -489,8 +550,13 @@ Prometheus format via prom-client. Every process labels its metrics with `role` 
    - 6B/6C: workers endpoint, jobs search, notify triggers, socket auth and routing.
    - 7A: correlation propagation from API to outbox to stream to worker, readiness status codes, metrics output.
 3. [ ] Sprint 7B: load tests, and `EXPLAIN (ANALYZE, BUFFERS)` on the hot queries, including the 7A cluster metrics snapshot.
-4. [ ] Sprint 7C: Docker Compose for every process, using the 7A readiness endpoints as healthchecks; CI; runbooks.
-5. [ ] Optional: per-queue job counts by status on the Queues page.
+4. [x] Sprint 7C: Docker Compose for every process, using the 7A readiness endpoints as healthchecks; CI; runbooks (`docs/operations.md`).
+5. [ ] Demonstrate 7C:
+   - Bring up `docker compose --profile full up -d --build` from a clean checkout.
+   - Watch the first CI run.
+   - Rehearse a backup and restore.
+6. [ ] Optional: ESLint for the backend; CI currently runs a syntax check only.
+7. [ ] Optional: per-queue job counts by status on the Queues page.
 
 ## Definition of done for each sprint
 

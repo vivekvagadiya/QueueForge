@@ -1,0 +1,4 @@
+# Docker Compose settings (keep .env.example tracked)
+.env
+.env.*
+!.env.example

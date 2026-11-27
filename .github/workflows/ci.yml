@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (syntax, migrations, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/api
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: queueforge
+          POSTGRES_PASSWORD: queueforge
+          POSTGRES_DB: queueforge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U queueforge -d queueforge"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # A fresh, empty database on every run. Tests derive queueforge_test from it.
+      DATABASE_URL: postgresql://queueforge:queueforge@localhost:5432/queueforge
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-only-jwt-secret-with-at-least-32-characters
+      LOG_LEVEL: warn
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/api/package-lock.json
+      - run: npm ci
+      - name: Syntax check
+        run: npm run check:syntax
+      - name: Migrations apply to a fresh database
+        run: npm run db:migrate
+      - name: Migrations roll back completely and re-apply
+        run: |
+          npm run db:migrate:undo:all
+          npm run db:migrate
+          npm run db:migrate:status
+      - name: Integration tests
+        run: npm test
+
+  frontend:
+    name: Frontend (lint, tests, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      VITE_API_BASE_URL: /api/v1
+      VITE_API_PROXY_TARGET: http://localhost:4000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose file
+        run: docker compose --profile full config --quiet
+      - name: Build images
+        run: docker compose --profile full build
