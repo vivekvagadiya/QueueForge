@@ -1,16 +1,38 @@
-# React + Vite
+# QueueForge dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite dashboard for the QueueForge API.
 
-Currently, two official plugins are available:
+## Run
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+# 1. API (backend/api): PostgreSQL configured and migrated
+npm run dev            # http://localhost:4000
 
-## React Compiler
+# 2. Dashboard (this folder)
+npm install
+npm run dev            # http://localhost:5173
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The dev server proxies `/api` to `http://localhost:4000`. Set `VITE_API_PROXY_TARGET` to point it elsewhere.
+For a build served from another origin, set `VITE_API_BASE_URL` (e.g. `https://api.example.com/api/v1`) and allow that origin in the API's `CORS_ORIGIN`.
 
-## Expanding the ESLint configuration
+## Scripts
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+| Script | |
+|---|---|
+| `npm run dev` | Dev server with HMR |
+| `npm test` | Vitest (jsdom) |
+| `npm run lint` | ESLint |
+| `npm run build` | Production build to `dist/` |
+
+On Windows, run `npm test` from PowerShell or cmd. In Git Bash, a lowercase drive letter in the working directory makes Vitest load twice ("failed to find the current suite").
+
+## Layout
+
+- `src/api/`: fetch client (`client.js`: token, `ApiError`, 401 handling) and endpoint functions
+- `src/auth/`: session context and route guards
+- `src/components/`: shell layout, modal, toasts, shared UI
+- `src/pages/`: Login/Register, Queues (+ create/edit dialog)
+- `src/test/`: test setup, fetch mock, `renderApp` helper
+
+See `docs/queueforge-sprint-wise-integration.md` (Sprint 6A) for behaviour details.
