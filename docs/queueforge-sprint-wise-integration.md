@@ -341,14 +341,45 @@ Behavior notes:
 - Per CLAUDE.md, this increment added no tests. It was verified with `npm run build`, `npm run lint` and `node --check`.
 
 ### Sprint 6C — Real-time Updates (Socket.IO)
-- [ ] Backend: integrate Socket.IO on the API server (authenticated) and emit job/worker state change events **only after** state is persisted in PostgreSQL.
-- [ ] Frontend: connect `socket.io-client` to update queues, jobs, attempts, and worker health live without page refresh.
-- [ ] Keep Socket.IO strictly as an enhancement — reconnects/refreshes always fall back to API/PostgreSQL as the source of truth.
+- [x] Backend: integrate Socket.IO on the API server (authenticated) and emit job/worker state change events **only after** state is persisted in PostgreSQL.
+- [x] Frontend: connect `socket.io-client` to update queues, jobs, attempts, and worker health live without page refresh.
+- [x] Keep Socket.IO strictly as an enhancement — reconnects/refreshes always fall back to API/PostgreSQL as the source of truth.
+
+#### How it works (Sprint 6C)
+- **Event source: PostgreSQL `NOTIFY` from triggers** (migration `20261128000008`). Triggers on `jobs`, `queues` and `workers` call `pg_notify('queueforge_events', …)`.
+  - PostgreSQL delivers a notification only when the sending transaction commits, and drops it on rollback. So events can only describe committed state, whichever process wrote it: API, worker, recovery or publisher. No writer code changed.
+  - What triggers an event:
+    - jobs: insert, or a change of `status` or `cancel_requested_at`;
+    - queues: any insert or update;
+    - workers: insert, or a change of `status` or `active_jobs`.
+
+    Lease renewals and heartbeats don't notify.
+  - Payloads are small invalidation hints: `{ type, id, queueId?, status, activeJobs? }`, plus the owner's `userId` for routing only. Retention deletes don't notify.
+- **API process** (`src/realtime/`):
+  - `PgEventListener` holds one dedicated `LISTEN` connection, separate from the Sequelize pool, and reconnects with backoff.
+  - After a reconnect it broadcasts `resync`, because notifications sent while it was disconnected are lost.
+  - `createSocketServer` attaches Socket.IO to the HTTP server at `/socket.io`, with the same CORS origin as the API.
+- **Socket auth and routing:**
+  - The handshake requires `auth.token`, a valid access token checked like REST requests. The socket is disconnected when that token expires.
+  - Job and queue events go only to the owner's room (`user:<id>`), and the `userId` is stripped before sending. Worker events go to every authenticated client.
+  - Events are coalesced per room for 250 ms, latest state per entity, and sent as one `events` batch, so bursts (for example recovery releasing many jobs) stay cheap.
+- **Clients never trust event contents as data.** They reload from the REST API, so ownership checks and serialization stay in one place, and the page always shows what PostgreSQL holds. Socket.IO can be down entirely and every page still works through load and Refresh.
+- **Frontend** (`src/realtime/`):
+  - `RealtimeProvider` connects while signed in. In development, the Vite dev server proxies `/socket.io` (with WebSocket upgrade). With an absolute `VITE_API_BASE_URL`, it connects to that origin.
+  - `useLiveRefresh(match, refresh)` debounces matching events by 300 ms into one quiet reload (no dimming). Every subscriber reloads after a reconnect or a server `resync`.
+  - What each page listens for:
+    - Queues: any queue event.
+    - Jobs: job events for this queue, and changes to the queue itself.
+    - Job detail: events for this job (status, attempts, cancel progress).
+    - Workers: worker events. Heartbeat ages advance locally between reloads.
+  - The top bar shows the connection state: Live, Connecting, Reconnecting, or Live updates off.
+- **Setup:** run `npm run db:migrate` in `backend/api`. The API refuses to start while migrations are pending.
+- Per CLAUDE.md, this increment added no tests. It was verified with `npm run build`, `npm run lint` and `node --check`.
 
 ### Acceptance criteria
-- [ ] Users can inspect queues, jobs, attempts, and worker health.
-- [ ] Refreshing the dashboard restores the same persisted state.
-- [ ] Socket.IO is an enhancement, not the source of truth.
+- [x] Users can inspect queues, jobs, attempts, and worker health.
+- [x] Refreshing the dashboard restores the same persisted state.
+- [x] Socket.IO is an enhancement, not the source of truth.
 
 ## Sprint 7 — Observability, testing, and production hardening
 
@@ -375,10 +406,11 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Sprint 6C: decide where events come from. Workers, recovery and the API all change state in separate processes, so options are PostgreSQL `LISTEN/NOTIFY` sent from the committing transaction, or an outbox event type. Real-time updates must never arrive before the committed state.
-2. [ ] Socket.IO on the API server, authenticated with the same JWT; clients join rooms for their own queues only.
-3. [ ] Frontend: live updates for the Queues, Jobs, Job detail and Workers pages. Reconnecting reloads from the API.
-4. [ ] Optional: per-queue job counts by status on the Queues page.
+1. [ ] Sprint 7: structured logs with correlation IDs across API, publisher, worker and recovery.
+2. [ ] Metrics: queue depth, waiting age, execution duration, retries, failures, worker utilization, publisher lag.
+3. [ ] Health/readiness endpoints for every process, and Docker Compose services for all of them.
+4. [ ] Tests for Sprint 6B/6C (workers endpoint, jobs search, notify triggers, socket auth and routing), which were deferred under the CLAUDE.md no-tests rule.
+5. [ ] Optional: per-queue job counts by status on the Queues page.
 
 ## Definition of done for each sprint
 
