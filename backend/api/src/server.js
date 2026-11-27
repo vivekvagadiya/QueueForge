@@ -5,6 +5,8 @@ import { logger } from './config/logger.js';
 import { closeDatabase } from './config/database.js';
 import { initDatabase } from './database/bootstrap.js';
 import { closeRedisClient } from './config/redis.js';
+import { PgEventListener } from './realtime/pgEventListener.js';
+import { createSocketServer } from './realtime/socketServer.js';
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
@@ -43,6 +45,18 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
+// Real-time updates (Sprint 6C): committed-state notifications from PostgreSQL
+// relayed over Socket.IO. If the listener can't connect it keeps retrying; the
+// REST API works regardless, since Socket.IO is only an enhancement.
+const realtimeLogger = logger.child({ component: 'realtime' });
+const eventListener = new PgEventListener({ connectionString: env.DATABASE_URL, logger: realtimeLogger });
+const realtime = createSocketServer(server, {
+  listener: eventListener,
+  corsOrigin: env.corsOrigin,
+  logger: realtimeLogger,
+});
+await eventListener.start();
+
 const shutdown = async (signal, exitCode = 0) => {
   if (isShuttingDown) {
     return;
@@ -59,12 +73,11 @@ const shutdown = async (signal, exitCode = 0) => {
   forceTimer.unref();
 
   try {
-    await new Promise((resolve, reject) => {
-      server.close((err) => (err ? reject(err) : resolve()));
-    });
-    logger.info('HTTP server closed');
+    // Disconnects sockets and closes the HTTP server (see createSocketServer).
+    await realtime.close();
+    logger.info('HTTP and Socket.IO servers closed');
 
-    await Promise.allSettled([closeDatabase(), closeRedisClient()]);
+    await Promise.allSettled([eventListener.stop(), closeDatabase(), closeRedisClient()]);
 
     clearTimeout(forceTimer);
     logger.info('QueueForge API shutdown complete');
