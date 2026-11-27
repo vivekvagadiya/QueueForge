@@ -4,7 +4,10 @@ import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { closeDatabase } from './config/database.js';
 import { initDatabase } from './database/bootstrap.js';
-import { closeRedisClient } from './config/redis.js';
+import { closeRedisClient, getRedisClient } from './config/redis.js';
+import { configureApiReadiness } from './controllers/health.controller.js';
+import { registerClusterMetrics } from './observability/clusterMetrics.js';
+import { postgresCheck, redisPingCheck, stateCheck } from './observability/health.js';
 import { PgEventListener } from './realtime/pgEventListener.js';
 import { createSocketServer } from './realtime/socketServer.js';
 
@@ -23,6 +26,9 @@ const instanceMeta = {
 
 await initDatabase('API');
 
+// Queue depth, waiting age, worker utilization and outbox backlog on /metrics.
+registerClusterMetrics({ cacheMs: env.METRICS_CACHE_MS });
+
 const server = app.listen(env.PORT, () => {
   logger.info(instanceMeta, 'QueueForge API server started');
   console.info(
@@ -31,7 +37,8 @@ const server = app.listen(env.PORT, () => {
       `[QueueForge API] Instance running (${env.NODE_ENV})`,
       `  PID / Host : ${instanceMeta.pid} @ ${instanceMeta.hostname} (${instanceMeta.nodeVersion})`,
       `  Server URL : http://localhost:${env.PORT}`,
-      `  Health URL : http://localhost:${env.PORT}/api/v1/health`,
+      `  Health URL : http://localhost:${env.PORT}/api/v1/health/ready`,
+      `  Metrics URL: http://localhost:${env.PORT}/metrics`,
       `  CORS Origin: ${env.CORS_ORIGIN}`,
       `  Database   : ${instanceMeta.databaseConfigured ? 'configured' : 'not configured'}`,
       `  Redis      : ${instanceMeta.redisConfigured ? 'configured' : 'not configured'}`,
@@ -57,11 +64,21 @@ const realtime = createSocketServer(server, {
 });
 await eventListener.start();
 
+// Readiness (GET /api/v1/health/ready): the API needs PostgreSQL to serve.
+// Redis (only the publisher and workers depend on it) and the realtime
+// listener are reported, and mark the API "degraded", without failing readiness.
+const readiness = configureApiReadiness([
+  postgresCheck(),
+  redisPingCheck(env.REDIS_URL ? getRedisClient() : null, { critical: false }),
+  stateCheck('realtime', () => eventListener.connected, { critical: false, code: 'NOT_CONNECTED' }),
+]);
+
 const shutdown = async (signal, exitCode = 0) => {
   if (isShuttingDown) {
     return;
   }
   isShuttingDown = true;
+  readiness.markShuttingDown();
 
   logger.info({ signal }, 'Shutting down QueueForge API server');
   console.info(`[QueueForge API] Shutting down instance (pid=${process.pid}, signal=${signal})...`);

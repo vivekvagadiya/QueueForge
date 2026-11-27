@@ -79,6 +79,18 @@ const envSchema = z.object({
   STREAM_RETENTION_MS: z.coerce.number().int().min(0).default(60 * 60 * 1000),
   // Consumers with no pending entries that have been idle this long are deleted.
   STREAM_CONSUMER_RETENTION_MS: z.coerce.number().int().min(0).default(DAY_MS),
+
+  // Observability
+  // Port for the health/metrics HTTP server of the publisher, worker and
+  // recovery processes. Unset = no server. The API serves these on PORT.
+  OPS_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  OPS_HOST: z.string().trim().min(1).default('0.0.0.0'),
+  // When set, /metrics requires `Authorization: Bearer <METRICS_TOKEN>`.
+  METRICS_TOKEN: z.string().min(16, 'METRICS_TOKEN must be at least 16 characters').optional(),
+  // Database-derived gauges (queue depth, waiting age, workers, outbox) are
+  // computed at most this often, however many scrapers ask.
+  METRICS_CACHE_MS: z.coerce.number().int().min(0).default(5000),
+  HEALTH_CHECK_TIMEOUT_MS: z.coerce.number().int().min(100).default(2000),
 }).superRefine((cfg, ctx) => {
   if (cfg.WORKER_CAPACITY_RETRY_BASE_MS > cfg.WORKER_CAPACITY_RETRY_MAX_MS) {
     ctx.addIssue({

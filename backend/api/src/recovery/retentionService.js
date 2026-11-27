@@ -1,4 +1,6 @@
 import { isRedisReady } from '../config/redis.js';
+import { withCorrelationId } from '../observability/context.js';
+import { retentionDeletedTotal } from '../observability/metrics.js';
 import { retentionRepository } from '../repositories/retention.repository.js';
 import { jobStreamKey } from '../streams/jobStream.js';
 import { retryDelayMs } from '../utils/backoff.js';
@@ -89,6 +91,9 @@ export class RetentionService {
       result.streamsSkipped = true;
     }
 
+    for (const kind of ['completedJobs', 'failedJobs', 'outboxEvents', 'streamEntries', 'consumers']) {
+      if (result[kind] > 0) retentionDeletedTotal.inc({ kind }, result[kind]);
+    }
     const removed = result.completedJobs + result.failedJobs + result.outboxEvents + result.streamEntries + result.consumers;
     if (removed > 0) this.logger.info(result, 'Retention pass removed old data');
     return result;
@@ -181,7 +186,7 @@ export class RetentionService {
       while (this.running) {
         let wait = this.config.intervalMs;
         try {
-          const r = await this.runOnce();
+          const r = await withCorrelationId(null, () => this.runOnce());
           consecutiveErrors = 0;
           const limit = this.config.batchSize * MAX_BATCHES_PER_PASS;
           if ([r.completedJobs, r.failedJobs, r.outboxEvents].includes(limit)) wait = 0;

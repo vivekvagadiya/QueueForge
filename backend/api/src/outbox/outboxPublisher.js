@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import os from 'node:os';
 import { isRedisReady } from '../config/redis.js';
+import { withCorrelationId } from '../observability/context.js';
+import { outboxEventsTotal, outboxPublishLag } from '../observability/metrics.js';
 import { outboxRepository } from '../repositories/outbox.repository.js';
 import { jobStreamKey, toStreamFields } from '../streams/jobStream.js';
 import { retryDelayMs } from '../utils/backoff.js';
@@ -53,6 +55,7 @@ export class OutboxPublisher {
       limit: this.config.batchSize,
       claimTimeoutMs: this.config.claimTimeoutMs,
     });
+    const claimedAt = Date.now();
     if (events.length === 0) {
       return { claimed: 0, published: 0, failed: 0, lost: 0 };
     }
@@ -80,7 +83,14 @@ export class OutboxPublisher {
         });
         if (!released) lost += 1;
         this.logger.warn(
-          { err, eventId: event.id, attempts: event.attempts, retryInMs: delay },
+          {
+            err,
+            eventId: event.id,
+            jobId: event.payload.jobId,
+            attempts: event.attempts,
+            retryInMs: delay,
+            ...(event.correlationId && { correlationId: event.correlationId }),
+          },
           'Outbox publish failed; will retry'
         );
       }
@@ -95,6 +105,18 @@ export class OutboxPublisher {
         'Published events whose claim was lost; another publisher may publish them again'
       );
     }
+
+    // Lag = age when claimed (PostgreSQL clock) + time spent here since the
+    // claim, so publisher/database clock skew doesn't distort it.
+    const sinceClaimSeconds = (Date.now() - claimedAt) / 1000;
+    const byId = new Map(events.map((e) => [e.id, e]));
+    for (const id of marked) {
+      const age = byId.get(id)?.ageAtClaimSeconds;
+      if (age !== null && age !== undefined) outboxPublishLag.observe(Math.max(0, age) + sinceClaimSeconds);
+    }
+    if (marked.length) outboxEventsTotal.inc({ result: 'published' }, marked.length);
+    if (failed) outboxEventsTotal.inc({ result: 'failed' }, failed);
+    if (lost) outboxEventsTotal.inc({ result: 'lost' }, lost);
 
     const result = { claimed: events.length, published: marked.length, failed, lost };
     this.logger.debug(result, 'Outbox cycle complete');
@@ -112,7 +134,8 @@ export class OutboxPublisher {
       while (this.running) {
         let delay = this.config.pollIntervalMs;
         try {
-          const { claimed } = await this.runOnce();
+          // Each cycle gets its own correlation ID for the publisher's own log lines.
+          const { claimed } = await withCorrelationId(null, () => this.runOnce());
           consecutiveErrors = 0;
           if (claimed === this.config.batchSize) delay = 0;
         } catch (err) {

@@ -1,6 +1,7 @@
 import { QueryTypes } from 'sequelize';
 import { getDatabase } from '../config/database.js';
 import { OUTBOX_EVENT_TYPES } from '../models/outboxEvent.model.js';
+import { getCorrelationId } from '../observability/context.js';
 
 /**
  * System-level maintenance queries used by the recovery process. Not user-scoped.
@@ -49,11 +50,12 @@ const releaseDue = (status, { limit }) =>
     );
     if (released.length > 0) {
       await select(
-        `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
-         SELECT 'job', r.id, $2, jsonb_build_object('jobId', r.id, 'queueId', r.queue_id)
+        `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload, correlation_id)
+         SELECT 'job', r.id, $2, jsonb_build_object('jobId', r.id, 'queueId', r.queue_id), $3::varchar
          FROM jsonb_to_recordset($1::jsonb) AS r(id uuid, queue_id uuid)
          RETURNING id`,
-        [JSON.stringify(released), OUTBOX_EVENT_TYPES.JOB_READY],
+        // The recovery pass's correlation ID, so the worker's logs link back to it.
+        [JSON.stringify(released), OUTBOX_EVENT_TYPES.JOB_READY, getCorrelationId()],
         transaction
       );
     }

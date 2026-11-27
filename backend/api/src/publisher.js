@@ -3,6 +3,8 @@ import { logger as rootLogger } from './config/logger.js';
 import { closeDatabase } from './config/database.js';
 import { closeRedis, createRedisClient } from './config/redis.js';
 import { initDatabase } from './database/bootstrap.js';
+import { createReadiness, postgresCheck, redisPingCheck, stateCheck } from './observability/health.js';
+import { startOpsServer } from './observability/opsServer.js';
 import { OutboxPublisher } from './outbox/outboxPublisher.js';
 import { outboxRepository } from './repositories/outbox.repository.js';
 
@@ -14,7 +16,8 @@ import { outboxRepository } from './repositories/outbox.repository.js';
 const SHUTDOWN_TIMEOUT_MS = 15_000;
 const STATS_INTERVAL_MS = 30_000;
 
-const logger = rootLogger.child({ role: 'publisher' });
+// The role ("publisher") is on every line via the base logger.
+const logger = rootLogger;
 
 await initDatabase('publisher');
 
@@ -33,6 +36,15 @@ const publisher = new OutboxPublisher({
 });
 
 publisher.start();
+
+// Ready when it can both claim (PostgreSQL) and publish (Redis).
+const readiness = createReadiness([
+  postgresCheck(),
+  redisPingCheck(redis),
+  stateCheck('publisher', () => publisher.running, { code: 'STOPPED' }),
+]);
+const ops = await startOpsServer({ readiness, logger });
+
 console.info(
   `[QueueForge publisher] Running (pid=${process.pid}, id=${publisher.publisherId}, stream prefix=${env.STREAM_PREFIX})`
 );
@@ -51,6 +63,7 @@ let shuttingDown = false;
 const shutdown = async (signal, exitCode = 0) => {
   if (shuttingDown) return;
   shuttingDown = true;
+  readiness.markShuttingDown();
   logger.info({ signal }, 'Shutting down outbox publisher');
 
   const forceTimer = setTimeout(() => {
@@ -61,7 +74,7 @@ const shutdown = async (signal, exitCode = 0) => {
 
   clearInterval(statsTimer);
   await publisher.stop();
-  await Promise.allSettled([closeRedis(redis), closeDatabase()]);
+  await Promise.allSettled([closeRedis(redis), closeDatabase(), ops?.close()]);
   clearTimeout(forceTimer);
   console.info(`[QueueForge publisher] Stopped (pid=${process.pid})`);
   process.exit(exitCode);

@@ -28,6 +28,8 @@ export class OutboxEvent extends Model {
         lastError: { type: DataTypes.TEXT, allowNull: true },
         publishedAt: { type: DataTypes.DATE, allowNull: true },
         streamId: { type: DataTypes.STRING(64), allowNull: true },
+        // Correlation ID of the request or recovery pass that created the event.
+        correlationId: { type: DataTypes.STRING(128), allowNull: true },
       },
       { sequelize, modelName: 'OutboxEvent', tableName: 'outbox_events', underscored: true }
     );

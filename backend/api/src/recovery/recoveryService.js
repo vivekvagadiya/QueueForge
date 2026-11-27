@@ -1,3 +1,5 @@
+import { withCorrelationId } from '../observability/context.js';
+import { recoveryActionsTotal } from '../observability/metrics.js';
 import { recoveryRepository } from '../repositories/recovery.repository.js';
 import { retryDelayMs } from '../utils/backoff.js';
 
@@ -32,6 +34,7 @@ export class RecoveryService {
     // Recover leases first so jobs recovered with a zero delay can be released in the same pass.
     const recovered = await this.repository.recoverExpiredLeases({ limit, retryBaseMs, retryMaxMs });
     for (const job of recovered) {
+      recoveryActionsTotal.inc({ action: 'lease_recovered', next_status: job.status });
       this.logger.warn(
         { jobId: job.id, queueId: job.queue_id, attempt: job.attempts_made, previousOwner: job.locked_by,
           leaseVersion: job.lease_version, nextStatus: job.status },
@@ -50,6 +53,9 @@ export class RecoveryService {
     }
 
     const stale = await this.repository.markStaleWorkers({ heartbeatTimeoutMs });
+    if (scheduled.length) recoveryActionsTotal.inc({ action: 'scheduled_released', next_status: 'WAITING' }, scheduled.length);
+    if (released.length) recoveryActionsTotal.inc({ action: 'retry_released', next_status: 'WAITING' }, released.length);
+    if (stale.length) recoveryActionsTotal.inc({ action: 'worker_unhealthy', next_status: 'UNHEALTHY' }, stale.length);
     for (const worker of stale) {
       this.logger.warn({ workerId: worker.id, name: worker.name }, 'Worker missed heartbeats; marked UNHEALTHY');
     }
@@ -73,7 +79,8 @@ export class RecoveryService {
       while (this.running) {
         let wait = this.config.intervalMs;
         try {
-          const { recovered, scheduled, released } = await this.runOnce();
+          // One correlation ID per pass; jobs it releases carry it to the worker.
+          const { recovered, scheduled, released } = await withCorrelationId(null, () => this.runOnce());
           consecutiveErrors = 0;
           if ([recovered, scheduled, released].includes(this.config.batchSize)) wait = 0;
         } catch (err) {

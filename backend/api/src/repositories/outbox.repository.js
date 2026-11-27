@@ -1,6 +1,7 @@
 import { QueryTypes } from 'sequelize';
 import { getDatabase } from '../config/database.js';
 import { OutboxEvent, OUTBOX_EVENT_TYPES } from '../models/outboxEvent.model.js';
+import { getCorrelationId } from '../observability/context.js';
 
 const toEvent = (row) => ({
   id: row.id,
@@ -9,6 +10,9 @@ const toEvent = (row) => ({
   eventType: row.event_type,
   payload: row.payload,
   attempts: row.attempts,
+  correlationId: row.correlation_id ?? null,
+  // Seconds since the event was committed, at claim time, by the PostgreSQL clock.
+  ageAtClaimSeconds: row.age_at_claim_seconds ?? null,
 });
 
 /**
@@ -25,6 +29,7 @@ export const outboxRepository = {
         aggregateId: job.id,
         eventType: OUTBOX_EVENT_TYPES.JOB_READY,
         payload: { jobId: job.id, queueId: job.queueId },
+        correlationId: getCorrelationId(),
       },
       { transaction }
     ),
@@ -38,13 +43,13 @@ export const outboxRepository = {
    */
   async createJobReadyForWaiting(queueId, { transaction }) {
     const rows = await getDatabase().query(
-      `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
-       SELECT 'job', id, $2, jsonb_build_object('jobId', id, 'queueId', queue_id)
+      `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload, correlation_id)
+       SELECT 'job', id, $2, jsonb_build_object('jobId', id, 'queueId', queue_id), $3::varchar
        FROM jobs
        WHERE queue_id = $1 AND status = 'WAITING'
        ORDER BY priority DESC, created_at
        RETURNING id`,
-      { bind: [queueId, OUTBOX_EVENT_TYPES.JOB_READY], type: QueryTypes.SELECT, transaction }
+      { bind: [queueId, OUTBOX_EVENT_TYPES.JOB_READY, getCorrelationId()], type: QueryTypes.SELECT, transaction }
     );
     return rows.length;
   },
@@ -73,7 +78,7 @@ export const outboxRepository = {
              updated_at = NOW()
          FROM claimable
          WHERE o.id = claimable.id
-         RETURNING o.*`,
+         RETURNING o.*, EXTRACT(EPOCH FROM NOW() - o.created_at)::float8 AS age_at_claim_seconds`,
         { bind: [publisherId, limit, claimTimeoutMs], type: QueryTypes.SELECT }
       )
     )

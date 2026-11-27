@@ -40,6 +40,8 @@ export const errorHandler = (err, req, res, _next) => {
   }
 
   const logPayload = {
+    // Explicit: errors raised by the body parsers occur outside the request context.
+    correlationId: req.id,
     err,
     statusCode,
     code,
@@ -60,6 +62,11 @@ export const errorHandler = (err, req, res, _next) => {
       message,
     },
   };
+
+  // Lets users quote the ID when reporting a problem; it matches the server logs.
+  if (req.id) {
+    response.error.requestId = req.id;
+  }
 
   if (details !== null) {
     response.error.details = details;

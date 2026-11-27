@@ -3,6 +3,8 @@ import { logger as rootLogger } from './config/logger.js';
 import { closeDatabase } from './config/database.js';
 import { closeRedis, createRedisClient } from './config/redis.js';
 import { initDatabase } from './database/bootstrap.js';
+import { createReadiness, postgresCheck, redisPingCheck, stateCheck } from './observability/health.js';
+import { startOpsServer } from './observability/opsServer.js';
 import { RecoveryService } from './recovery/recoveryService.js';
 import { RetentionService } from './recovery/retentionService.js';
 
@@ -15,7 +17,8 @@ import { RetentionService } from './recovery/retentionService.js';
  */
 const SHUTDOWN_TIMEOUT_MS = 15_000;
 
-const logger = rootLogger.child({ role: 'recovery' });
+// The role ("recovery") is on every line via the base logger.
+const logger = rootLogger;
 
 await initDatabase('recovery');
 
@@ -48,12 +51,22 @@ const retention = new RetentionService({
 
 service.start();
 retention.start();
+
+// Job recovery needs only PostgreSQL; Redis (stream trimming) is reported, not required.
+const readiness = createReadiness([
+  postgresCheck(),
+  redisPingCheck(redis, { critical: false }),
+  stateCheck('recovery', () => service.running, { code: 'STOPPED' }),
+]);
+const ops = await startOpsServer({ readiness, logger });
+
 console.info(`[QueueForge recovery] Running (pid=${process.pid}, interval=${env.RECOVERY_INTERVAL_MS}ms)`);
 
 let shuttingDown = false;
 const shutdown = async (signal, exitCode = 0) => {
   if (shuttingDown) return;
   shuttingDown = true;
+  readiness.markShuttingDown();
   logger.info({ signal }, 'Shutting down recovery service');
 
   const forceTimer = setTimeout(() => {
@@ -63,7 +76,7 @@ const shutdown = async (signal, exitCode = 0) => {
   forceTimer.unref();
 
   await Promise.allSettled([service.stop(), retention.stop()]);
-  await Promise.allSettled([closeRedis(redis), closeDatabase()]);
+  await Promise.allSettled([closeRedis(redis), closeDatabase(), ops?.close()]);
   clearTimeout(forceTimer);
   console.info(`[QueueForge recovery] Stopped (pid=${process.pid})`);
   process.exit(exitCode);

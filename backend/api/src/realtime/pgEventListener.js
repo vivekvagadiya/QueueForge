@@ -28,6 +28,11 @@ export class PgEventListener extends EventEmitter {
     this.retryTimer = null;
   }
 
+  /** True while the LISTEN connection is up (used by the API readiness report). */
+  get connected() {
+    return this.client !== null;
+  }
+
   async start() {
     this.stopped = false;
     await this.connect();

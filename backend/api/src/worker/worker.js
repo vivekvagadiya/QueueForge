@@ -2,6 +2,8 @@ import os from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { isRedisReady } from '../config/redis.js';
+import { withCorrelationId } from '../observability/context.js';
+import { jobAttemptsTotal, jobExecutionDuration, streamEntriesTotal } from '../observability/metrics.js';
 import { jobExecutionRepository } from '../repositories/jobExecution.repository.js';
 import { workerRepository } from '../repositories/worker.repository.js';
 import { ensureConsumerGroup, fromStreamFields, jobStreamKey } from '../streams/jobStream.js';
@@ -11,6 +13,24 @@ import { errorCode, isRetryable } from './errors.js';
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'DEAD', 'CANCELLED']);
 
 const entryKey = (streamKey, entryId) => `${streamKey}|${entryId}`;
+
+/**
+ * Metric outcome for a claimed attempt, from the entry outcome:
+ * completed / retrying / failed / dead / cancelled as written, interrupted
+ * (shutdown), lease_lost, fenced, or persist_error (outcome not written yet;
+ * lease recovery will finish it).
+ */
+const attemptOutcome = (outcome) => {
+  if (outcome.startsWith('interrupted:')) return 'interrupted';
+  if (outcome.startsWith('pending:')) return 'persist_error';
+  return outcome.replace('-', '_');
+};
+
+const recordAttempt = (claim, outcome, durationMs) => {
+  const labels = { queue_id: claim.queueId ?? 'unknown', outcome: attemptOutcome(String(outcome)) };
+  jobAttemptsTotal.inc(labels);
+  jobExecutionDuration.observe(labels, durationMs / 1000);
+};
 
 /**
  * Worker runtime. Consumes job.ready entries from per-queue Redis streams via a
@@ -142,9 +162,21 @@ export class Worker {
   /**
    * Handles one stream entry end to end. Never throws. Returns
    * `{ outcome, acked }` for logging and tests.
+   *
+   * Runs under the entry's correlation ID (the request or recovery pass that
+   * made the job ready), so every log line for it, including the handler's
+   * and the lease timer's, carries that ID.
    */
   async processEntry(streamKey, entryId, fields) {
     const entry = fromStreamFields(fields);
+    const result = await withCorrelationId(entry.correlationId, () =>
+      this.handleEntry(streamKey, entryId, entry, fields)
+    );
+    streamEntriesTotal.inc({ outcome: result.outcome, acked: String(result.acked) });
+    return result;
+  }
+
+  async handleEntry(streamKey, entryId, entry, fields) {
     const log = this.logger.child({ entryId, jobId: entry.jobId, eventId: entry.eventId });
 
     if (!entry.jobId || !entry.queueId) {
@@ -183,6 +215,13 @@ export class Worker {
       return { outcome: 'deferred:queue-at-capacity', acked: false, deferred: true };
     }
 
+    const result = await this.runClaimed(streamKey, entryId, claim, log, claimStartedAt);
+    recordAttempt(claim, result.outcome, Date.now() - claimStartedAt);
+    return result;
+  }
+
+  /** Executes a claimed job and persists its outcome; see processEntry. */
+  async runClaimed(streamKey, entryId, claim, log, claimStartedAt) {
     // 2. Execute outside any transaction, renewing the lease while it runs.
     const jobLog = log.child({ attempt: claim.attempt, leaseVersion: claim.leaseVersion });
     const lease = this.holdLease(claim, jobLog, claimStartedAt);

@@ -28,12 +28,17 @@ export const ensureConsumerGroup = async (redis, streamKey, group) => {
   }
 };
 
-/** Flat field/value list for XADD. Redis stream values are strings. */
+/**
+ * Flat field/value list for XADD. Redis stream values are strings. The
+ * correlation ID (when the event has one) lets the worker log under the ID of
+ * the request or recovery pass that made the job ready.
+ */
 export const toStreamFields = (event) => [
   'eventId', event.id,
   'eventType', event.eventType,
   'jobId', event.payload.jobId,
   'queueId', event.payload.queueId,
+  ...(event.correlationId ? ['correlationId', event.correlationId] : []),
 ];
 
 /** Inverse of toStreamFields, for consumers (Sprint 3) and tests. */
