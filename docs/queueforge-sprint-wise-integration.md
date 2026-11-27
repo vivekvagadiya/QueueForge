@@ -101,8 +101,9 @@ All routes are under `/api/v1`. Everything except `auth/register` and `auth/logi
 | POST | `/queues/:queueId/pause` | Stop dispatching (Sprint 5). Idempotent; `409 QUEUE_ARCHIVED` for archived queues |
 | POST | `/queues/:queueId/resume` | Resume dispatch and re-announce waiting jobs (Sprint 5). Idempotent; `409` for archived queues |
 | POST | `/queues/:queueId/jobs` | `{ name, payload?, priority?, maxAttempts?, delayMs? \| scheduledAt?, idempotencyKey? }`; the key may also be sent as the `Idempotency-Key` header |
-| GET | `/queues/:queueId/jobs` | `?page&limit&status=WAITING,SCHEDULED` |
+| GET | `/queues/:queueId/jobs` | `?page&limit&status=WAITING,SCHEDULED&search=` (`search`: name contains, or exact job ID; Sprint 6B) |
 | GET | `/jobs/:jobId` | Job plus attempt history |
+| GET | `/workers` | Sprint 6B. `?page&limit&status=RUNNING,UNHEALTHY`; read-only worker health, with `meta.statusCounts` |
 | POST | `/jobs/:jobId/cancel` | Sprint 5. `200` when the job is cancelled, or `202` when a running job was asked to stop (it stays `ACTIVE`). `409 JOB_NOT_CANCELLABLE` once finished |
 
 Behavior notes:
@@ -307,12 +308,37 @@ Behavior notes:
 - **Tests:** `npm test` in `frontend/` runs 24 tests: the API client, form rules, auth flows (login redirect-back, register errors, session restore, logout, expiry mid-session), and the Queues page (filters in the URL, refresh restore, pagination, pause/resume, create/edit errors, empty/error states). On Windows, run them from PowerShell or cmd. From Git Bash, a lowercase drive letter in the working directory (`c:\`) makes Vitest load itself twice and fail with "failed to find the current suite".
 
 ### Sprint 6B — Jobs, Attempts, and Workers Visibility
-- [ ] Backend: add read-only `GET /api/v1/workers` endpoint to expose worker status, concurrency, active jobs, and last heartbeat.
-- [ ] Build Jobs page (per queue): list jobs with search, status filters, pagination, and empty/error states.
-- [ ] Add job actions: submit new job (payload JSON, delay/schedule, priority, max attempts, idempotency key) and cancel job (`WAITING`/`SCHEDULED`/`RETRYING` or cooperative `ACTIVE`).
-- [ ] Build Job Detail & Attempts view: inspect payload, result, error details, and full `job_attempts` timeline.
-- [ ] Build Workers page: inspect worker health (`RUNNING`, `DRAINING`, `UNHEALTHY`, `STOPPED`), active job count, and heartbeat timestamps.
-- [ ] Ensure refreshing any page restores the exact persisted state from API/PostgreSQL.
+- [x] Backend: add read-only `GET /api/v1/workers` endpoint to expose worker status, concurrency, active jobs, and last heartbeat.
+- [x] Build Jobs page (per queue): list jobs with search, status filters, pagination, and empty/error states.
+- [x] Add job actions: submit new job (payload JSON, delay/schedule, priority, max attempts, idempotency key) and cancel job (`WAITING`/`SCHEDULED`/`RETRYING` or cooperative `ACTIVE`).
+- [x] Build Job Detail & Attempts view: inspect payload, result, error details, and full `job_attempts` timeline.
+- [x] Build Workers page: inspect worker health (`RUNNING`, `DRAINING`, `UNHEALTHY`, `STOPPED`), active job count, and heartbeat timestamps.
+- [x] Ensure refreshing any page restores the exact persisted state from API/PostgreSQL.
+
+#### How it works (Sprint 6B)
+- **`GET /api/v1/workers`** (authenticated, read-only): `?page&limit&status=RUNNING,UNHEALTHY`.
+  - Live workers come first (anything not `STOPPED`), then the most recent heartbeat.
+  - `heartbeatAgeMs` is computed with PostgreSQL `NOW()`, so the browser's clock doesn't affect it. `meta.statusCounts` gives counts per status over all workers.
+  - **Visibility decision:** workers are shared infrastructure, so every signed-in user sees the list, including name, hostname, pid, status, capacity and heartbeat. What a worker consumes is filtered per caller: `consumesAllQueues` for `WORKER_QUEUES=*`, otherwise `queueIds` lists only the caller's own queues. Other tenants' queue IDs are never returned.
+- **`GET /queues/:id/jobs?search=`** matches the job name case-insensitively (wildcards treated literally), or the exact job ID when the search is a UUID.
+- **Routes:**
+  - `/queues/:queueId/jobs`: search, status and page in the URL.
+  - `/jobs/:jobId`: job detail.
+  - `/workers`: status and page in the URL.
+
+  Every page loads from the API on open and has a Refresh button, so a reload always shows persisted state. Live updates come in 6C.
+- **Submit job:**
+  - Name, with the built-in handlers suggested.
+  - JSON-object payload, validated before sending.
+  - When: now, after a delay in seconds (sent as `delayMs`), or at a local date and time (sent as an ISO `scheduledAt`).
+  - Priority and max attempts, where blank means the queue default.
+  - Idempotency key. Server errors such as `IDEMPOTENCY_KEY_CONFLICT` appear on the matching field.
+- **Cancel:** available on the list and the detail page for `SCHEDULED`, `WAITING`, `RETRYING` and `ACTIVE` jobs, after a confirm prompt.
+  - The row or page shows the job the API returned. `CANCELLED` means done.
+  - An `ACTIVE` job shows "Cancelling…" with the time of the request until its handler returns, so a running job is never shown as stopped early.
+- **Job detail:** summary, payload, result, last error, and the attempts timeline. Each attempt shows status, start and finish times, duration, worker, error code and message, and result. Error stacks are not exposed.
+- **Workers page:** status tabs with counts, capacity bar (active / concurrency), heartbeat age, which queues the worker consumes, and start and stop times.
+- Per CLAUDE.md, this increment added no tests. It was verified with `npm run build`, `npm run lint` and `node --check`.
 
 ### Sprint 6C — Real-time Updates (Socket.IO)
 - [ ] Backend: integrate Socket.IO on the API server (authenticated) and emit job/worker state change events **only after** state is persisted in PostgreSQL.
@@ -349,11 +375,10 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Sprint 6B backend: `GET /workers` (status, concurrency, active jobs, last heartbeat). Workers are system-wide, not user-owned, so decide what a user may see. Possibly per-queue job counts by status for the Queues page.
-2. [ ] Jobs page per queue (`/queues/:queueId/jobs`): search (the jobs list needs a `search` param too, e.g. on name or ID), status filters and pagination in the URL, like the Queues page.
-3. [ ] Submit-job dialog (payload JSON, delay or schedule, priority, max attempts, idempotency key) and cancel (`200` vs `202` cooperative).
-4. [ ] Job detail with the attempts timeline, and the Workers page.
-5. [ ] Sprint 6C: decide where events come from (for example an outbox event type, or PostgreSQL `LISTEN/NOTIFY`) so real-time updates never come before the committed state.
+1. [ ] Sprint 6C: decide where events come from. Workers, recovery and the API all change state in separate processes, so options are PostgreSQL `LISTEN/NOTIFY` sent from the committing transaction, or an outbox event type. Real-time updates must never arrive before the committed state.
+2. [ ] Socket.IO on the API server, authenticated with the same JWT; clients join rooms for their own queues only.
+3. [ ] Frontend: live updates for the Queues, Jobs, Job detail and Workers pages. Reconnecting reloads from the API.
+4. [ ] Optional: per-queue job counts by status on the Queues page.
 
 ## Definition of done for each sprint
 
