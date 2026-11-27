@@ -38,6 +38,8 @@ export class Job extends Model {
         scheduledAt: { type: DataTypes.DATE, allowNull: true },
         startedAt: { type: DataTypes.DATE, allowNull: true },
         completedAt: { type: DataTypes.DATE, allowNull: true },
+        // Set by a cancel request; an ACTIVE job stays ACTIVE until its handler stops.
+        cancelRequestedAt: { type: DataTypes.DATE, allowNull: true },
         lockedBy: { type: DataTypes.UUID, allowNull: true },
         lockExpiresAt: { type: DataTypes.DATE, allowNull: true },
         // BIGINT is returned as a string by pg; compare fencing tokens as strings/BigInt.

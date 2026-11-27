@@ -189,7 +189,8 @@ beforeEach(async () => {
   readers = [];
   services = [];
   owner = await createUser();
-  queue = await createQueue(owner.auth, { name: 'recovery' });
+  // Concurrency above the number of jobs any test claims at once; limits are tested in controls.test.js.
+  queue = await createQueue(owner.auth, { name: 'recovery', concurrency: 50 });
 });
 afterEach(async () => {
   await Promise.all(services.map((s) => s.stop()));
@@ -321,7 +322,7 @@ describe('expired lease recovery', () => {
     await expireLease(job.id);
 
     const result = await makeRecovery().runOnce();
-    assert.deepEqual(result, { recovered: 1, released: 0, unhealthyWorkers: 0 });
+    assert.deepEqual(result, { recovered: 1, scheduled: 0, released: 0, unhealthyWorkers: 0 });
     const row = await jobRow(job.id);
     assert.equal(row.status, 'DEAD');
     assert.ok(row.completed_at);

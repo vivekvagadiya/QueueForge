@@ -47,6 +47,7 @@ export const serializeJob = (job, { attempts } = {}) => ({
   scheduledAt: job.scheduledAt,
   startedAt: job.startedAt,
   completedAt: job.completedAt,
+  cancelRequestedAt: job.cancelRequestedAt,
   result: job.result,
   lastError: job.lastError,
   createdAt: job.createdAt,

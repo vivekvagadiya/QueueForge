@@ -47,10 +47,14 @@ export const workerRepository = {
   /**
    * System-level queue discovery for workers configured with WORKER_QUEUES="*".
    * Deliberately not user-scoped: workers serve every tenant.
+   *
+   * Paused and archived queues are left out, so their streams are not read
+   * while they cannot dispatch. This is an optimization only: the claim checks
+   * the queue status under a lock, and resuming re-announces WAITING jobs.
    */
   async listConsumableQueueIds() {
     const rows = await getDatabase().query(
-      `SELECT id FROM queues WHERE status <> 'ARCHIVED' ORDER BY created_at`,
+      `SELECT id FROM queues WHERE status = 'ACTIVE' ORDER BY created_at`,
       { type: QueryTypes.SELECT }
     );
     return rows.map((r) => r.id);

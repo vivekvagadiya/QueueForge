@@ -20,6 +20,15 @@ const entryKey = (streamKey, entryId) => `${streamKey}|${entryId}`;
  *             in the background) -> persist outcome fenced by lease_version
  *             -> commit -> XACK.
  *
+ * The claim also enforces queue controls under a lock on the queue row:
+ * paused/archived queues dispatch nothing (the entry is acknowledged; resume
+ * re-announces), and a queue at `queues.concurrency` defers the entry: it
+ * stays pending and the claim is retried with backoff.
+ *
+ * Cancellation is cooperative: running jobs are polled for cancel requests and
+ * their handler's signal is aborted; the job is recorded CANCELLED only after
+ * the handler has returned.
+ *
  * A Redis delivery never grants execution rights; only the PG claim does.
  * XACK happens only after the durable outcome commits, so a crash at any point
  * leaves the entry pending. Pending entries idle for too long are taken over
@@ -48,6 +57,9 @@ export class Worker {
       heartbeatMs: 5000,
       pendingIdleMs: 60_000,
       pendingCheckMs: 15_000,
+      cancelCheckMs: 1000,
+      capacityRetryBaseMs: 200,
+      capacityRetryMaxMs: 2000,
       ...config,
     };
     if (this.config.leaseRenewMs >= this.config.leaseMs) {
@@ -74,8 +86,17 @@ export class Worker {
     // is per stream, so a multi-stream read can return more entries than free
     // slots; the excess waits here (at most one batch, bounded by stream count).
     this.backlog = [];
-    // Entries in the backlog or in flight, so XAUTOCLAIM doesn't hand us our own work twice.
+    // Entries in the backlog, in flight or deferred, so XAUTOCLAIM doesn't hand us our own work twice.
     this.activeEntries = new Set();
+    // Entries whose claim hit the queue's concurrency limit, keyed by entryKey:
+    // { item, retryAt }. They stay pending in Redis (so a crash loses nothing),
+    // and their streams are not read until the retry, so a full queue costs
+    // one claim attempt per backoff interval instead of a stream of rejections.
+    this.deferred = new Map();
+    // Jobs executing now, by job ID: { leaseVersion, cancel }. Used by the cancel poll.
+    this.runningJobs = new Map();
+    this.cancelTimer = null;
+    this.cancelCheckPromise = null;
     this.abortController = new AbortController();
     this.stopSignal = new Promise((resolve) => {
       this.signalStop = resolve;
@@ -150,13 +171,24 @@ export class Worker {
     if (!claim) {
       return this.handleUnclaimable(streamKey, entryId, entry, log);
     }
+    if (claim.rejected === 'QUEUE_NOT_ACTIVE') {
+      // Paused or archived: nothing is dispatched. Resuming the queue emits a
+      // fresh job.ready for every WAITING job, so this entry can go.
+      log.debug({ queueStatus: claim.queueStatus }, 'Queue is not active; entry discarded until resume');
+      return this.finish(streamKey, entryId, 'discarded:queue-not-active', log);
+    }
+    if (claim.rejected === 'QUEUE_AT_CAPACITY') {
+      // Keep the entry pending (no ack) and retry the claim later; see deferEntry().
+      log.debug({ active: claim.active, concurrency: claim.concurrency }, 'Queue at its concurrency limit; deferring');
+      return { outcome: 'deferred:queue-at-capacity', acked: false, deferred: true };
+    }
 
     // 2. Execute outside any transaction, renewing the lease while it runs.
     const jobLog = log.child({ attempt: claim.attempt, leaseVersion: claim.leaseVersion });
     const lease = this.holdLease(claim, jobLog, claimStartedAt);
     let execution;
     try {
-      execution = await this.execute(claim, jobLog, lease.signal);
+      execution = await this.execute(claim, jobLog, lease.signal, lease.abortReason);
     } finally {
       lease.release();
     }
@@ -167,11 +199,17 @@ export class Worker {
       jobLog.warn('Handler aborted after the lease was lost; outcome discarded');
       return this.finish(streamKey, entryId, 'lease-lost', jobLog);
     }
+    if (execution.abandoned === 'cancelled') {
+      return this.recordCancelled(streamKey, entryId, claim, jobLog);
+    }
     if (execution.abandoned === 'shutdown') {
       return this.releaseInterrupted(streamKey, entryId, claim, jobLog);
     }
 
     // 3. Persist the outcome with the fencing token, then 4. acknowledge.
+    //    A handler that ignored a cancel request and succeeded is recorded as
+    //    COMPLETED: that is what happened. A failure after a cancel request
+    //    becomes CANCELLED (never retried); the repository decides that.
     try {
       const { outcome, applied } = execution.ok
         ? { outcome: 'completed', applied: await this.repository.complete(claim, { result: execution.result }) }
@@ -223,12 +261,15 @@ export class Worker {
 
   /**
    * Renews the job lease every `leaseRenewMs` while the handler runs. The
-   * returned signal aborts on shutdown, or when the lease is lost: either
-   * another owner took the job over, or renewal kept failing until the lease
-   * had certainly expired (recovery may hand the job out again at any moment).
+   * returned signal aborts on shutdown, on a cancel request, or when the lease
+   * is lost: either another owner took the job over, or renewal kept failing
+   * until the lease had certainly expired (recovery may hand the job out again
+   * at any moment). `abortReason()` says which, lease loss taking precedence
+   * because then this worker may not write anything.
    */
   holdLease(claim, log, claimStartedAt) {
     const controller = new AbortController();
+    const cancelController = new AbortController();
     let lastRenewedAt = claimStartedAt; // conservative: the lease started no later than this
     let renewing = false;
     let released = false;
@@ -238,6 +279,17 @@ export class Worker {
       log.warn({ reason }, 'Job lease lost; aborting handler');
       controller.abort(new Error(`Job lease lost (${reason})`));
     };
+
+    this.runningJobs.set(claim.jobId, {
+      leaseVersion: claim.leaseVersion,
+      cancel: () => {
+        if (cancelController.signal.aborted || released) return;
+        log.info('Cancel requested; aborting handler');
+        const err = new Error('Job cancelled');
+        err.code = 'CANCELLED';
+        cancelController.abort(err);
+      },
+    });
 
     const timer = setInterval(async () => {
       if (renewing || released || controller.signal.aborted) return;
@@ -256,15 +308,45 @@ export class Worker {
     }, this.config.leaseRenewMs);
 
     return {
-      signal: AbortSignal.any([this.abortController.signal, controller.signal]),
+      signal: AbortSignal.any([this.abortController.signal, controller.signal, cancelController.signal]),
+      abortReason: () => {
+        if (controller.signal.aborted) return 'lease-lost';
+        if (cancelController.signal.aborted) return 'cancelled';
+        return 'shutdown';
+      },
       release: () => {
         released = true;
         clearInterval(timer);
+        this.runningJobs.delete(claim.jobId);
       },
     };
   }
 
-  async execute(claim, log, signal = this.abortController.signal) {
+  /**
+   * Polls for cancel requests on the jobs this worker is running and aborts
+   * those handlers. The job stays ACTIVE until the handler has returned and
+   * the outcome is written (see recordCancelled), so a running job is never
+   * reported as cancelled.
+   */
+  async checkCancellations() {
+    if (this.cancelCheckPromise || this.runningJobs.size === 0) return this.cancelCheckPromise;
+    this.cancelCheckPromise = (async () => {
+      try {
+        const requested = await this.repository.findCancelRequested({ workerId: this.workerId });
+        for (const { jobId, leaseVersion } of requested) {
+          const running = this.runningJobs.get(jobId);
+          if (running && running.leaseVersion === leaseVersion) running.cancel();
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'Cancel check failed; will retry');
+      } finally {
+        this.cancelCheckPromise = null;
+      }
+    })();
+    return this.cancelCheckPromise;
+  }
+
+  async execute(claim, log, signal = this.abortController.signal, abortReason = null) {
     const handler = this.registry.get(claim.name);
     const started = Date.now();
 
@@ -291,7 +373,9 @@ export class Worker {
       });
     } catch (err) {
       if (signal.aborted) {
-        return { abandoned: this.abortController.signal.aborted ? 'shutdown' : 'lease-lost' };
+        return {
+          abandoned: abortReason ? abortReason() : this.abortController.signal.aborted ? 'shutdown' : 'lease-lost',
+        };
       }
       const error = err instanceof Error ? err : new Error(String(err));
       return { ok: false, error, durationMs: Date.now() - started };
@@ -325,7 +409,35 @@ export class Worker {
           : null,
       error: { code: errorCode(err), message: err.message || String(err), stack: err.stack },
     });
-    return { outcome: nextStatus.toLowerCase(), applied };
+    // The repository returns the status actually written (CANCELLED wins if a
+    // cancel was requested), or false when fenced out.
+    const written = typeof applied === 'string' ? applied : nextStatus;
+    return { outcome: written.toLowerCase(), applied: Boolean(applied) };
+  }
+
+  /**
+   * The handler stopped after a cancel request and has returned: record the
+   * job CANCELLED and the attempt CANCELLED, fenced like any outcome. If the
+   * write fails the job stays ACTIVE with cancel_requested_at set, and lease
+   * recovery makes it CANCELLED once the lease expires.
+   */
+  async recordCancelled(streamKey, entryId, claim, log) {
+    try {
+      const applied = await this.repository.fail(claim, {
+        nextStatus: 'CANCELLED',
+        attemptStatus: 'CANCELLED',
+        retryDelayMs: null,
+        error: { code: 'CANCELLED', message: 'Job was cancelled while running' },
+      });
+      if (!applied) {
+        return this.finish(streamKey, entryId, 'fenced', log);
+      }
+      log.info('Handler stopped after a cancel request; job CANCELLED');
+      return this.finish(streamKey, entryId, 'cancelled', log);
+    } catch (err) {
+      log.error({ err }, 'Could not record cancellation; lease recovery will finish it');
+      return { outcome: 'pending:cancel-error', acked: false };
+    }
   }
 
   /**
@@ -409,12 +521,59 @@ export class Worker {
     this.backlog.push(item);
   }
 
-  startEntry({ streamKey, entryId, fields }) {
-    const task = this.processEntry(streamKey, entryId, fields).finally(() => {
-      this.inflight.delete(task);
-      this.activeEntries.delete(entryKey(streamKey, entryId));
-    });
+  startEntry(item) {
+    const { streamKey, entryId, fields } = item;
+    const task = this.processEntry(streamKey, entryId, fields)
+      .then((result) => {
+        if (result.deferred) this.deferEntry(item);
+        else this.activeEntries.delete(entryKey(streamKey, entryId));
+        return result;
+      })
+      .finally(() => this.inflight.delete(task));
     this.inflight.add(task);
+  }
+
+  /**
+   * Holds an entry whose queue was at its concurrency limit and schedules a
+   * claim retry with backoff. Its stream is not read meanwhile (see
+   * readableStreams), so each worker holds at most a few entries per full queue.
+   * The entry stays pending in Redis: if this worker dies, XAUTOCLAIM hands it on.
+   */
+  deferEntry(item) {
+    const key = entryKey(item.streamKey, item.entryId);
+    if (!this.running) {
+      this.activeEntries.delete(key); // shutting down: leave it pending for another worker
+      return;
+    }
+    item.capacityRetries = (item.capacityRetries ?? 0) + 1;
+    const wait = retryDelayMs(item.capacityRetries, {
+      baseMs: this.config.capacityRetryBaseMs,
+      maxMs: this.config.capacityRetryMaxMs,
+    });
+    this.deferred.set(key, { item, retryAt: Date.now() + wait });
+  }
+
+  /** Moves deferred entries whose retry time has come back into the backlog. */
+  releaseDueDeferred(now = Date.now()) {
+    for (const [key, { item, retryAt }] of this.deferred) {
+      if (retryAt <= now) {
+        this.deferred.delete(key);
+        this.backlog.push(item);
+      }
+    }
+  }
+
+  nextDeferredRetryAt() {
+    let next = Infinity;
+    for (const { retryAt } of this.deferred.values()) next = Math.min(next, retryAt);
+    return next;
+  }
+
+  /** Streams to read new entries from: all except those with a deferred entry. */
+  readableStreams() {
+    if (this.deferred.size === 0) return this.streamKeys;
+    const held = new Set([...this.deferred.values()].map(({ item }) => item.streamKey));
+    return this.streamKeys.filter((key) => !held.has(key));
   }
 
   /** Runs already-delivered backlog entries, respecting the concurrency limit. */
@@ -456,6 +615,7 @@ export class Worker {
     this.running = true;
     this.status = 'RUNNING';
     this.heartbeatTimer = setInterval(() => this.heartbeat(), this.config.heartbeatMs);
+    this.cancelTimer = setInterval(() => this.checkCancellations(), this.config.cancelCheckMs);
     this.logger.info(
       { concurrency: this.config.concurrency, handlers: this.registry.names() },
       'Worker started'
@@ -472,6 +632,7 @@ export class Worker {
           await Promise.race([...this.inflight, this.stopSignal]);
           continue;
         }
+        if (this.deferred.size > 0) this.releaseDueDeferred();
         if (this.backlog.length > 0) {
           this.startEntry(this.backlog.shift());
           continue;
@@ -502,12 +663,21 @@ export class Worker {
           if ((await this.claimStalePending(free)) > 0) continue;
         }
 
-        const perStream = Math.max(1, Math.ceil(free / this.streamKeys.length));
+        // Streams with a deferred entry (queue at capacity) are not read until
+        // its retry; don't block past that retry either.
+        const readable = this.readableStreams();
+        const untilRetry = this.deferred.size > 0 ? Math.max(10, this.nextDeferredRetryAt() - Date.now()) : Infinity;
+        if (readable.length === 0) {
+          await Promise.race([delay(Math.min(untilRetry, this.config.blockMs)), this.stopSignal]);
+          continue;
+        }
+
+        const perStream = Math.max(1, Math.ceil(free / readable.length));
         const response = await this.reader.xreadgroup(
           'GROUP', this.config.group, this.consumerName,
           'COUNT', perStream,
-          'BLOCK', this.config.blockMs,
-          'STREAMS', ...this.streamKeys, ...this.streamKeys.map(() => '>')
+          'BLOCK', Math.min(this.config.blockMs, untilRetry),
+          'STREAMS', ...readable, ...readable.map(() => '>')
         );
         consecutiveErrors = 0;
 
@@ -567,8 +737,16 @@ export class Worker {
       await Promise.allSettled([...this.inflight]);
     }
 
+    if (this.deferred.size > 0) {
+      // Never claimed, so nothing to hand back; they stay pending for XAUTOCLAIM.
+      this.logger.info({ entries: this.deferred.size }, 'Leaving deferred entries pending for other workers');
+      for (const key of this.deferred.keys()) this.activeEntries.delete(key);
+      this.deferred.clear();
+    }
+
     clearInterval(this.heartbeatTimer);
-    await this.heartbeatPromise;
+    clearInterval(this.cancelTimer);
+    await Promise.all([this.heartbeatPromise, this.cancelCheckPromise]);
     this.status = 'STOPPED';
     await this.workers.setStatus(this.workerId, 'STOPPED').catch((err) =>
       this.logger.warn({ err }, 'Could not mark worker STOPPED')

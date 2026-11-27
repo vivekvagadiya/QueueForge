@@ -17,8 +17,9 @@
 - [x] Transactional outbox and publisher deliver jobs to Redis Streams.
 - [x] Workers consume streams and execute jobs.
 - [x] Leases, heartbeat, retry release, and crash recovery.
+- [x] Scheduled release, queue pause/resume, cooperative cancellation, queue concurrency limits, and retention.
 
-**Immediate next step:** Sprint 5 — scheduled job release, queue pause/resume, cancellation, and concurrency limits.
+**Immediate next step:** Sprint 6: React dashboard and real-time visibility.
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -26,6 +27,7 @@
 - `jobs.locked_by` has no foreign key on purpose: a lease must remain recoverable even if the worker row is cleaned up.
 - Status columns use `VARCHAR` + `CHECK` constraints rather than PostgreSQL enum types, which are easier to change in later migrations.
 - `job_attempts.lease_version` records the fencing token each attempt ran under.
+- Sprint 5 migration `20261127000007` adds `jobs.cancel_requested_at` plus partial indexes for retention (terminal jobs by `completed_at`, published outbox rows by `published_at`) and for the worker's cancel poll.
 
 ## Agreed MVP database schema
 
@@ -96,14 +98,17 @@ All routes are under `/api/v1`. Everything except `auth/register` and `auth/logi
 | POST | `/queues` | `{ name, description?, concurrency?, defaultJobOptions?: { maxAttempts?, priority? } }` |
 | GET | `/queues` | `?page&limit&status=ACTIVE,PAUSED` |
 | GET / PATCH | `/queues/:queueId` | PATCH accepts any create field plus `status`; `defaultJobOptions` is replaced whole |
+| POST | `/queues/:queueId/pause` | Stop dispatching (Sprint 5). Idempotent; `409 QUEUE_ARCHIVED` for archived queues |
+| POST | `/queues/:queueId/resume` | Resume dispatch and re-announce waiting jobs (Sprint 5). Idempotent; `409` for archived queues |
 | POST | `/queues/:queueId/jobs` | `{ name, payload?, priority?, maxAttempts?, delayMs? \| scheduledAt?, idempotencyKey? }`; the key may also be sent as the `Idempotency-Key` header |
 | GET | `/queues/:queueId/jobs` | `?page&limit&status=WAITING,SCHEDULED` |
 | GET | `/jobs/:jobId` | Job plus attempt history |
+| POST | `/jobs/:jobId/cancel` | Sprint 5. `200` when the job is cancelled, or `202` when a running job was asked to stop (it stays `ACTIVE`). `409 JOB_NOT_CANCELLABLE` once finished |
 
 Behavior notes:
 - Another user's queue or job returns `404`, the same as a missing one, so IDs don't reveal what exists.
 - Idempotency keys are unique per queue. A replay returns `200` with the original job and `Idempotent-Replayed: true`. Reusing a key with a different `name` or `payload` returns `409 IDEMPOTENCY_KEY_CONFLICT`.
-- `ARCHIVED` queues reject new jobs (`409`). `PAUSED` queues still accept them; pausing will only stop dispatch (Sprint 5).
+- `ARCHIVED` queues reject new jobs (`409`). `PAUSED` queues still accept them; pausing only stops dispatch.
 - Errors always have the shape `{ success: false, error: { code, message, details? } }`.
 - Tests: `npm test` runs the integration suite against `queueforge_test`, which is created automatically. Set `TEST_DATABASE_URL` to use a different database; its name must end in `_test`.
 
@@ -132,8 +137,7 @@ Behavior notes:
 - Run the publisher with `npm run publisher`; several instances can run at once. Each cycle claims due events with `FOR UPDATE SKIP LOCKED`, sends each one with `XADD`, then marks the successful ones `PUBLISHED`. Failed events go back to `PENDING` with exponential backoff and jitter.
 - While Redis is unreachable the publisher claims nothing, so attempt counts don't climb. A claim older than `OUTBOX_CLAIM_TIMEOUT_MS` is treated as abandoned by a crashed publisher and taken over. Every update after a claim checks `locked_by`.
 - Streams: `<STREAM_PREFIX>:queue:<queueId>:jobs`, with entry fields `eventId`, `eventType`, `jobId`, `queueId`. The job payload is never copied to Redis.
-- Streams are not trimmed yet. Choose a trimming policy once consumers acknowledge entries (Sprint 3/4), so unconsumed entries aren't dropped.
-- Published outbox rows are kept; cleanup belongs to the retention work in Sprint 5.
+- Stream trimming and cleanup of published outbox rows are handled by retention (Sprint 5).
 
 ## Sprint 3 — Worker runtime and atomic job claiming
 
@@ -210,28 +214,64 @@ Behavior notes:
 - **Heartbeat:** every `WORKER_HEARTBEAT_MS` the worker updates `last_heartbeat_at`, `active_jobs` and its own status (`RUNNING` / `DRAINING`). Heartbeats continue while draining.
 - **Shutdown:** handlers aborted at the end of the grace period have actually returned. Their job is therefore handed back at once: the attempt becomes `INTERRUPTED` (`WORKER_SHUTDOWN`) and the job goes to `RETRYING`/`DEAD` with a fenced write, and the entry is acknowledged. If that write fails, the job stays `ACTIVE` and lease recovery handles it.
 - Crash windows covered by `test/recovery.test.js`: before claim, during execution, after the DB outcome but before `XACK`, recovery racing a finishing worker, concurrent recovery instances, renewal loss, and retry exhaustion. A real `taskkill /F` of a worker mid-job was also verified end to end.
-- **Known limits:**
-  - Dead consumers are never removed from the consumer group (`XGROUP DELCONSUMER`).
-  - Streams and published outbox rows are not trimmed yet (Sprint 5 retention).
-  - `SCHEDULED` jobs are still not released (Sprint 5 scheduler; it should live in the recovery process and follow the same event policy).
+- **Known limits** (all closed in Sprint 5): dead consumers are now removed, streams and outbox rows are trimmed by retention, and `SCHEDULED` jobs are released by the scheduler.
 
 ## Sprint 5 — Scheduling and queue controls
 
 **Goal:** Add time-based execution and operational controls.
 
 ### Tasks
-- [ ] Implement delayed/scheduled job release.
-- [ ] Add queue pause/resume.
-- [ ] Add job cancellation; running cancellation must be cooperative.
-- [ ] Enforce worker and queue concurrency limits.
-- [ ] Add rate limiting if required by the MVP.
-- [ ] Define retention/cleanup for completed jobs and old attempts.
+- [x] Implement delayed/scheduled job release.
+- [x] Add queue pause/resume.
+- [x] Add job cancellation; running cancellation must be cooperative.
+- [x] Enforce worker and queue concurrency limits.
+- [x] Add rate limiting if required by the MVP. *Decision: not required for the MVP. Queue concurrency covers the common need of protecting a downstream service. Per-queue rate limits (jobs per interval) can be added later at the same claim point.*
+- [x] Define retention/cleanup for completed jobs and old attempts.
 
 ### Acceptance criteria
-- [ ] Scheduled jobs become eligible at the correct time.
-- [ ] Paused queues do not dispatch new work.
-- [ ] Concurrency limits hold across multiple worker processes.
-- [ ] Running cancellation does not falsely report a job as stopped while its handler is still executing.
+- [x] Scheduled jobs become eligible at the correct time (within one `RECOVERY_INTERVAL_MS`, never early).
+- [x] Paused queues do not dispatch new work.
+- [x] Concurrency limits hold across multiple worker processes.
+- [x] Running cancellation does not falsely report a job as stopped while its handler is still executing.
+
+### How it works (Sprint 5)
+- **Scheduler:** the recovery process has a new step. Due `SCHEDULED` jobs (`delayMs` / `scheduledAt`) become `WAITING`, and a `job.ready` event is inserted in the same transaction. This is the same code path as retry release: `FOR UPDATE SKIP LOCKED`, with the status re-checked in the `UPDATE`, so several instances are safe. A job is never released early. It is released at most one `RECOVERY_INTERVAL_MS` late, plus the publisher poll and worker read.
+- **Claim-time queue controls:** the claim now locks the queue row first (`FOR NO KEY UPDATE`). Under that lock it reads the queue status and counts the queue's `ACTIVE` jobs:
+  - Queue not `ACTIVE` (paused or archived) → `{ rejected: 'QUEUE_NOT_ACTIVE' }`.
+  - Queue already running `queues.concurrency` jobs → `{ rejected: 'QUEUE_AT_CAPACITY' }`.
+
+  Claims on one queue are serialized, so the count includes every committed claim from every worker process. `NO KEY UPDATE` doesn't conflict with the `KEY SHARE` lock that job inserts take, so submission is never blocked. Cost: claims on a single queue run one at a time; each holds the lock for only a few milliseconds. An `ACTIVE` job whose worker died still holds its slot until lease recovery frees it.
+- **Pause/resume:** `POST /queues/:id/pause` and `/resume`, or `PATCH status`. Status changes take the same queue-row lock, so a claim and a pause never interleave. Jobs submitted to a paused queue are accepted and stay `WAITING`.
+  - Entries a worker reads for a paused queue are acknowledged without running anything.
+  - When a queue becomes `ACTIVE` again, every `WAITING` job gets a fresh `job.ready` event in the same transaction as the status change. This extends the event policy: *every transition that makes a WAITING job claimable again emits an event*.
+  - Workers using `WORKER_QUEUES=*` stop reading paused and archived streams within `WORKER_QUEUE_REFRESH_MS`. This is only an optimization; the claim check is what enforces the pause.
+  - Scheduled and retry releases still happen while paused; those jobs wait as `WAITING`.
+  - Resume emits one event per waiting job in a single transaction, which is fine at MVP scale.
+- **Concurrency:** `WORKER_CONCURRENCY` limits each process, as before. `queues.concurrency` limits each queue across all workers, enforced by the claim.
+  - When a claim is rejected for capacity, the worker **defers** the entry: no ack, so it stays pending and a crash loses nothing. The worker stops reading that queue's stream and retries the claim with backoff (`WORKER_CAPACITY_RETRY_BASE_MS` to `WORKER_CAPACITY_RETRY_MAX_MS`).
+  - So a full queue costs each worker about one claim attempt per backoff interval, rather than a stream of rejections.
+  - Deferred entries are left pending on shutdown; XAUTOCLAIM hands them to another worker.
+- **Cancellation:** `POST /jobs/:id/cancel`.
+  - `SCHEDULED`, `WAITING` or `RETRYING` jobs become `CANCELLED` immediately (`200`). Nothing is running them, and the claim only takes `WAITING` jobs. This is a single guarded `UPDATE`: if a claim commits first, the re-check sees `ACTIVE` and the running-job path below applies.
+  - An `ACTIVE` job only gets `cancel_requested_at` and **stays `ACTIVE`** (`202`). Every `WORKER_CANCEL_CHECK_MS`, each worker queries for cancel requests on its running jobs and aborts those handlers' `signal`. Once the handler has returned, the job and its attempt are written as `CANCELLED`, fenced like any other outcome.
+  - A handler that ignores the signal and succeeds is recorded as `COMPLETED`, because that is what happened. A failure after a cancel request becomes `CANCELLED` and is never retried.
+  - If a worker dies while a cancel is pending, lease recovery turns the job `CANCELLED` (attempt `INTERRUPTED`) instead of retrying it. This relies on the lease being expired, the same assumption Sprint 4 makes.
+  - Cancelling a `CANCELLED` job is a no-op `200`. Other finished jobs return `409 JOB_NOT_CANCELLABLE`.
+- **Retention:** runs in the recovery process every `RETENTION_INTERVAL_MS`, in batches of `RETENTION_BATCH_SIZE` using `SKIP LOCKED`. An age of `0` keeps that data forever.
+  - **Jobs:** `COMPLETED` jobs older than `JOB_RETENTION_COMPLETED_MS` (default 7 days) and `FAILED` / `DEAD` / `CANCELLED` jobs older than `JOB_RETENTION_FAILED_MS` (default 30 days) are deleted, measured from `completed_at`. Their attempts go with them through the FK cascade. Deleting a job frees its idempotency key.
+  - **Outbox:** `PUBLISHED` events older than `OUTBOX_RETENTION_MS` (default 1 day) are deleted. `PENDING` and `PROCESSING` events never are.
+  - **Streams:** each stream is trimmed with `XTRIM MINID` to the oldest entry still needed. Nothing at or after a group's smallest pending ID or its first undelivered entry is removed. Acknowledged entries are kept for `STREAM_RETENTION_MS` (default 1 hour). Streams without a consumer group are never trimmed. Redis is used only here; the step is skipped while Redis is down.
+  - **Consumers:** removed with `XGROUP DELCONSUMER` only when all of these hold:
+    - no pending entries;
+    - idle longer than `STREAM_CONSUMER_RETENTION_MS`;
+    - the worker row is `STOPPED`, gone, or silent for that long.
+
+    Pending entries are re-checked right before the delete.
+- **Known limits:**
+  - A freed queue slot is noticed on the next capacity retry, so a saturated queue can sit idle for up to `WORKER_CAPACITY_RETRY_MAX_MS` between jobs. In the end-to-end smoke test, 6 one-second jobs at concurrency 2 took about 5.7s instead of the ideal 3s. Lower the max for latency, or later add a slot-freed notification.
+  - Scheduled jobs start up to about `RECOVERY_INTERVAL_MS` + `OUTBOX_POLL_INTERVAL_MS` after their time; the smoke test measured about 1.7s late with 1s defaults.
+- End to end (API, publisher, recovery and two workers, each a separate process) was verified: the limit held at 2 active jobs across both workers, a delayed job ran after its delay, a paused queue held a job for 3s and ran it on resume, a running 60s job was cancelled in under 1s (attempt `CANCELLED`), and cancelling a completed job returned `409`.
+- Tests: `test/controls.test.js` covers scheduling accuracy and concurrent release, a pause racing a claim, resume re-announcement, every cancellation path (including a handler that ignores its signal), the concurrency limit under simultaneous claims and with two running worker loops, and retention boundaries for rows, stream entries and consumers.
 
 ## Sprint 6 — Dashboard and real-time visibility
 
@@ -274,11 +314,11 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Scheduler step in the recovery process: due `SCHEDULED` jobs → `WAITING` + `job.ready` event in one transaction.
-2. [ ] Queue pause/resume: paused queues keep accepting jobs but are not dispatched. Decide whether that is enforced at claim time or by holding events back.
-3. [ ] Cancellation: `WAITING`/`SCHEDULED`/`RETRYING` jobs cancel directly. `ACTIVE` jobs cancel cooperatively through the handler `signal`, and are only reported as cancelled once the handler has stopped.
-4. [ ] Queue-level concurrency limits across worker processes (`queues.concurrency`).
-5. [ ] Retention: trim streams and delete old published outbox rows, completed jobs and attempts. Consider `XGROUP DELCONSUMER` for long-dead consumers that have no pending entries.
+1. [ ] Scaffold the React dashboard (`frontend/`) with auth against the existing API.
+2. [ ] Read-only API for the dashboard that isn't there yet: list workers (status, heartbeat, active jobs) and queue stats (counts per job status).
+3. [ ] Pages: queues (with pause/resume), jobs per queue (filters, pagination, cancel), job detail with attempts, workers.
+4. [ ] Socket.IO: emit job/worker state changes only after they are committed. The dashboard must work fully without the socket (reload from the API).
+5. [ ] Decide where events come from (e.g. an outbox event type, or PostgreSQL `LISTEN/NOTIFY`) so real-time updates never come before the committed state.
 
 ## Definition of done for each sprint
 

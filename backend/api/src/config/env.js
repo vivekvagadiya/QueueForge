@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import { z } from 'zod';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -50,6 +52,12 @@ const envSchema = z.object({
   // Stream entries pending longer than this in any consumer are taken over (XAUTOCLAIM).
   WORKER_PENDING_IDLE_MS: z.coerce.number().int().min(1000).default(60_000),
   WORKER_PENDING_CHECK_MS: z.coerce.number().int().min(100).default(15_000),
+  // How often a worker checks whether any of its running jobs were cancelled.
+  WORKER_CANCEL_CHECK_MS: z.coerce.number().int().min(50).default(1000),
+  // A worker that hits a queue's concurrency limit holds the entry and retries
+  // the claim with backoff between these bounds, without reading that queue.
+  WORKER_CAPACITY_RETRY_BASE_MS: z.coerce.number().int().min(10).default(200),
+  WORKER_CAPACITY_RETRY_MAX_MS: z.coerce.number().int().min(10).default(2000),
   JOB_RETRY_BASE_MS: z.coerce.number().int().min(1).default(1000),
   JOB_RETRY_MAX_MS: z.coerce.number().int().min(1).default(300_000),
 
@@ -58,7 +66,27 @@ const envSchema = z.object({
   RECOVERY_BATCH_SIZE: z.coerce.number().int().min(1).max(1000).default(100),
   // A worker with no heartbeat for this long is marked UNHEALTHY.
   WORKER_HEARTBEAT_TIMEOUT_MS: z.coerce.number().int().min(1000).default(30_000),
+
+  // Retention (run by the recovery process). An age of 0 keeps rows forever.
+  RETENTION_INTERVAL_MS: z.coerce.number().int().min(1000).default(60_000),
+  RETENTION_BATCH_SIZE: z.coerce.number().int().min(1).max(10_000).default(1000),
+  JOB_RETENTION_COMPLETED_MS: z.coerce.number().int().min(0).default(7 * DAY_MS),
+  // FAILED, DEAD and CANCELLED jobs (with their attempts) are kept longer for debugging.
+  JOB_RETENTION_FAILED_MS: z.coerce.number().int().min(0).default(30 * DAY_MS),
+  OUTBOX_RETENTION_MS: z.coerce.number().int().min(0).default(DAY_MS),
+  // Acknowledged stream entries older than this are trimmed. Unacknowledged
+  // or undelivered entries are never trimmed.
+  STREAM_RETENTION_MS: z.coerce.number().int().min(0).default(60 * 60 * 1000),
+  // Consumers with no pending entries that have been idle this long are deleted.
+  STREAM_CONSUMER_RETENTION_MS: z.coerce.number().int().min(0).default(DAY_MS),
 }).superRefine((cfg, ctx) => {
+  if (cfg.WORKER_CAPACITY_RETRY_BASE_MS > cfg.WORKER_CAPACITY_RETRY_MAX_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['WORKER_CAPACITY_RETRY_BASE_MS'],
+      message: 'must not exceed WORKER_CAPACITY_RETRY_MAX_MS',
+    });
+  }
   if (cfg.WORKER_LEASE_RENEW_MS !== undefined && cfg.WORKER_LEASE_RENEW_MS >= cfg.WORKER_LEASE_MS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,

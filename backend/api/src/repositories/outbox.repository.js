@@ -30,6 +30,26 @@ export const outboxRepository = {
     ),
 
   /**
+   * Inserts a job.ready event for every WAITING job in the queue. Used when a
+   * queue becomes ACTIVE again: entries consumed while it was paused were
+   * acknowledged without running, so every waiting job is announced afresh.
+   * Duplicates are harmless (the claim decides). Returns the number of events.
+   * Must be called inside the transaction that changes the queue status.
+   */
+  async createJobReadyForWaiting(queueId, { transaction }) {
+    const rows = await getDatabase().query(
+      `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+       SELECT 'job', id, $2, jsonb_build_object('jobId', id, 'queueId', queue_id)
+       FROM jobs
+       WHERE queue_id = $1 AND status = 'WAITING'
+       ORDER BY priority DESC, created_at
+       RETURNING id`,
+      { bind: [queueId, OUTBOX_EVENT_TYPES.JOB_READY], type: QueryTypes.SELECT, transaction }
+    );
+    return rows.length;
+  },
+
+  /**
    * Atomically claims up to `limit` events: due PENDING events, plus PROCESSING
    * events whose claim is older than `claimTimeoutMs` (publisher crashed).
    * SKIP LOCKED lets concurrent publishers claim disjoint batches without waiting.

@@ -20,42 +20,52 @@ const BACKOFF_SQL = (attemptsExpr) =>
        $2::double precision * power(2, GREATEST(0, ${attemptsExpr} - 1)))
      * (0.5 + random() * 0.5) / 1000)`;
 
-export const recoveryRepository = {
-  /**
-   * RETRYING jobs whose retry time has come -> WAITING, plus a fresh job.ready
-   * outbox event for each, in one transaction (event policy: every transition
-   * into WAITING emits an event). Returns the released job IDs.
-   */
-  releaseDueRetries: ({ limit }) =>
-    getDatabase().transaction(async (transaction) => {
-      const released = await select(
-        `WITH due AS (
-           SELECT id FROM jobs
-           WHERE status = 'RETRYING' AND scheduled_at <= NOW()
-           ORDER BY scheduled_at
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         )
-         UPDATE jobs j
-         SET status = 'WAITING', updated_at = NOW()
-         FROM due
-         WHERE j.id = due.id AND j.status = 'RETRYING'
-         RETURNING j.id, j.queue_id`,
-        [limit],
+/**
+ * Jobs in `status` whose scheduled_at has passed -> WAITING, plus a fresh
+ * job.ready outbox event for each, in one transaction (event policy: every
+ * transition into WAITING emits an event). One status per statement so each
+ * uses its own partial index (jobs_scheduled_due_idx / jobs_retrying_due_idx).
+ *
+ * Jobs in paused queues are released too; workers won't claim them until the
+ * queue is resumed, and resuming re-announces every WAITING job.
+ */
+const releaseDue = (status, { limit }) =>
+  getDatabase().transaction(async (transaction) => {
+    const released = await select(
+      `WITH due AS (
+         SELECT id FROM jobs
+         WHERE status = $2::text AND scheduled_at <= NOW()
+         ORDER BY scheduled_at
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE jobs j
+       SET status = 'WAITING', updated_at = NOW()
+       FROM due
+       WHERE j.id = due.id AND j.status = $2::text
+       RETURNING j.id, j.queue_id`,
+      [limit, status],
+      transaction
+    );
+    if (released.length > 0) {
+      await select(
+        `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+         SELECT 'job', r.id, $2, jsonb_build_object('jobId', r.id, 'queueId', r.queue_id)
+         FROM jsonb_to_recordset($1::jsonb) AS r(id uuid, queue_id uuid)
+         RETURNING id`,
+        [JSON.stringify(released), OUTBOX_EVENT_TYPES.JOB_READY],
         transaction
       );
-      if (released.length > 0) {
-        await select(
-          `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
-           SELECT 'job', r.id, $2, jsonb_build_object('jobId', r.id, 'queueId', r.queue_id)
-           FROM jsonb_to_recordset($1::jsonb) AS r(id uuid, queue_id uuid)
-           RETURNING id`,
-          [JSON.stringify(released), OUTBOX_EVENT_TYPES.JOB_READY],
-          transaction
-        );
-      }
-      return released.map((r) => r.id);
-    }),
+    }
+    return released.map((r) => r.id);
+  });
+
+export const recoveryRepository = {
+  /** Scheduler: due SCHEDULED jobs (delayMs / scheduledAt) -> WAITING + job.ready. Returns IDs. */
+  releaseDueScheduled: ({ limit }) => releaseDue('SCHEDULED', { limit }),
+
+  /** Due RETRYING jobs -> WAITING + job.ready. Returns IDs. */
+  releaseDueRetries: ({ limit }) => releaseDue('RETRYING', { limit }),
 
   /**
    * ACTIVE jobs whose lease expired (worker crashed, hung, or lost the database):
@@ -64,12 +74,16 @@ export const recoveryRepository = {
    * the job and its attempt history change atomically.
    *
    * The interrupted attempt counts toward max_attempts: a job that kills its
-   * worker every time must eventually stop being retried.
+   * worker every time must eventually stop being retried. A job the user asked
+   * to cancel becomes CANCELLED instead of being retried.
    */
   async recoverExpiredLeases({ limit, retryBaseMs, retryMaxMs }) {
     return select(
       `WITH expired AS (
-         SELECT id, attempts_made, max_attempts, locked_by, lease_version
+         SELECT id, attempts_made, max_attempts, locked_by, lease_version,
+                CASE WHEN cancel_requested_at IS NOT NULL THEN 'CANCELLED'
+                     WHEN attempts_made >= max_attempts THEN 'DEAD'
+                     ELSE 'RETRYING' END AS next_status
          FROM jobs
          WHERE status = 'ACTIVE' AND lock_expires_at < NOW()
          ORDER BY lock_expires_at
@@ -78,10 +92,11 @@ export const recoveryRepository = {
        ),
        recovered AS (
          UPDATE jobs j
-         SET status = CASE WHEN e.attempts_made >= e.max_attempts THEN 'DEAD' ELSE 'RETRYING' END,
-             scheduled_at = CASE WHEN e.attempts_made >= e.max_attempts THEN j.scheduled_at
-                                 ELSE NOW() + ${BACKOFF_SQL('e.attempts_made')} END,
-             completed_at = CASE WHEN e.attempts_made >= e.max_attempts THEN NOW() ELSE NULL END,
+         SET status = e.next_status,
+             scheduled_at = CASE WHEN e.next_status = 'RETRYING'
+                                 THEN NOW() + ${BACKOFF_SQL('e.attempts_made')}
+                                 ELSE j.scheduled_at END,
+             completed_at = CASE WHEN e.next_status = 'RETRYING' THEN NULL ELSE NOW() END,
              last_error = jsonb_build_object(
                'code', 'LEASE_EXPIRED',
                'message', 'Worker lease expired before the attempt finished',

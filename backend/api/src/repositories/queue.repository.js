@@ -7,6 +7,17 @@ export const queueRepository = {
 
   findForUser: ({ queueId, userId }) => Queue.findOne({ where: { id: queueId, userId } }),
 
+  /**
+   * Same, locking the row FOR NO KEY UPDATE until `transaction` ends. Claims take
+   * the same lock, so a status change and a claim never interleave.
+   */
+  findForUserLocked: ({ queueId, userId }, { transaction }) =>
+    Queue.findOne({
+      where: { id: queueId, userId },
+      lock: transaction.LOCK.NO_KEY_UPDATE,
+      transaction,
+    }),
+
   listForUser: ({ userId, statuses, limit, offset }) =>
     Queue.findAndCountAll({
       where: { userId, ...(statuses ? { status: { [Op.in]: statuses } } : {}) },
@@ -18,5 +29,5 @@ export const queueRepository = {
       offset,
     }),
 
-  update: (queue, changes) => queue.update(changes),
+  update: (queue, changes, { transaction } = {}) => queue.update(changes, { transaction }),
 };

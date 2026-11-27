@@ -28,6 +28,12 @@ export const listJobs = async (req, res) => {
   res.status(200).json({ success: true, ...result });
 };
 
+/** 200 when the job is cancelled; 202 when a running job has been asked to stop. */
+export const cancelJob = async (req, res) => {
+  const { job, pending } = await jobService.cancel({ userId: req.user.id, jobId: req.validated.params.jobId });
+  res.status(pending ? 202 : 200).json({ success: true, data: job });
+};
+
 export const getJob = async (req, res) => {
   const job = await jobService.get({ userId: req.user.id, jobId: req.validated.params.jobId });
   res.status(200).json({ success: true, data: job });

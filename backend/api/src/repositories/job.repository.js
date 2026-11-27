@@ -62,6 +62,31 @@ export const jobRepository = {
       offset,
     }),
 
+  /**
+   * Cancels a job in one guarded statement. SCHEDULED, WAITING and RETRYING
+   * jobs become CANCELLED at once (nothing is running them, and the claim only
+   * takes WAITING jobs). An ACTIVE job only gets cancel_requested_at: its
+   * worker aborts the handler and records CANCELLED once it has stopped.
+   * If a claim commits first, the WHERE re-check sees the ACTIVE row and the
+   * request path applies. Returns the new status, or null if the job was
+   * already finished. `jobId` must already be verified as owned by the caller.
+   */
+  async requestCancel(jobId) {
+    const rows = await getDatabase().query(
+      `UPDATE jobs
+       SET status = CASE WHEN status = 'ACTIVE' THEN status ELSE 'CANCELLED' END,
+           cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+           completed_at = CASE WHEN status = 'ACTIVE' THEN completed_at ELSE NOW() END,
+           updated_at = NOW()
+       WHERE id = $1 AND status IN ('SCHEDULED', 'WAITING', 'RETRYING', 'ACTIVE')
+       RETURNING status`,
+      { bind: [jobId], type: QueryTypes.SELECT }
+    );
+    return rows[0]?.status ?? null;
+  },
+
+  findById: (jobId) => Job.findByPk(jobId),
+
   listAttempts: (jobId) =>
     JobAttempt.findAll({ where: { jobId }, order: [['attemptNumber', 'ASC']] }),
 };

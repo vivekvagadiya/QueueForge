@@ -72,7 +72,7 @@ export const jobService = {
 
     // The job and its job.ready outbox event commit together or not at all, so
     // a committed job can never miss its notification (ADR-004). SCHEDULED jobs
-    // get their event later, when the scheduler releases them (Sprint 5).
+    // get their event later, when the scheduler (recovery process) releases them.
     const job = await getDatabase().transaction(async (transaction) => {
       const inserted = await jobRepository.insertUnlessDuplicateKey(
         {
@@ -114,6 +114,28 @@ export const jobService = {
       offset: (page - 1) * limit,
     });
     return { data: rows.map((job) => serializeJob(job)), meta: paginationMeta({ page, limit, total: count }) };
+  },
+
+  /**
+   * Cancels a job. Returns `{ job, pending }`: `pending` is true when the job is
+   * ACTIVE and its handler has been asked to stop; the job then stays ACTIVE
+   * (with cancelRequestedAt set) until the worker confirms the handler returned.
+   * Cancelling a CANCELLED job is a no-op; other finished jobs return 409.
+   */
+  async cancel({ userId, jobId }) {
+    const owned = await jobRepository.findForUser({ jobId, userId });
+    if (!owned) {
+      throw notFound('Job');
+    }
+    const status = await jobRepository.requestCancel(owned.id);
+    const job = await jobRepository.findById(owned.id);
+    if (status === null && job.status !== 'CANCELLED') {
+      throw conflict(`Job is ${job.status} and can no longer be cancelled`, 'JOB_NOT_CANCELLABLE', {
+        status: job.status,
+      });
+    }
+    // The re-read may already show a later state (e.g. the worker finished).
+    return { job: serializeJob(job), pending: job.status === 'ACTIVE' };
   },
 
   async get({ userId, jobId }) {

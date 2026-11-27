@@ -36,6 +36,9 @@ const config = {
   pendingIdleMs: env.WORKER_PENDING_IDLE_MS,
   pendingCheckMs: env.WORKER_PENDING_CHECK_MS,
   shutdownGraceMs: env.WORKER_SHUTDOWN_GRACE_MS,
+  cancelCheckMs: env.WORKER_CANCEL_CHECK_MS,
+  capacityRetryBaseMs: env.WORKER_CAPACITY_RETRY_BASE_MS,
+  capacityRetryMaxMs: env.WORKER_CAPACITY_RETRY_MAX_MS,
   retryBaseMs: env.JOB_RETRY_BASE_MS,
   retryMaxMs: env.JOB_RETRY_MAX_MS,
 };

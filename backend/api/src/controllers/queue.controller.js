@@ -15,6 +15,16 @@ export const getQueue = async (req, res) => {
   res.status(200).json({ success: true, data: queue });
 };
 
+export const pauseQueue = async (req, res) => {
+  const queue = await queueService.pause({ userId: req.user.id, ...req.validated.params });
+  res.status(200).json({ success: true, data: queue });
+};
+
+export const resumeQueue = async (req, res) => {
+  const queue = await queueService.resume({ userId: req.user.id, ...req.validated.params });
+  res.status(200).json({ success: true, data: queue });
+};
+
 export const updateQueue = async (req, res) => {
   const queue = await queueService.update({
     userId: req.user.id,

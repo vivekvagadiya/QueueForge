@@ -21,11 +21,47 @@ const ERROR_STACK_MAX = 8000;
 export const jobExecutionRepository = {
   /**
    * Atomically claims a WAITING job and records the new attempt in one
-   * transaction. Returns the claim (with the fencing token), or null if the
-   * job was not eligible. Throws on database errors.
+   * transaction. Returns:
+   * - the claim (with the fencing token) on success;
+   * - `{ rejected: 'QUEUE_NOT_ACTIVE' }` when the queue is paused or archived;
+   * - `{ rejected: 'QUEUE_AT_CAPACITY' }` when the queue already runs
+   *   `queues.concurrency` jobs;
+   * - null when the job itself is not claimable (not WAITING, missing, wrong queue).
+   * Throws on database errors.
+   *
+   * The queue row is locked first (FOR NO KEY UPDATE), which serializes claims
+   * per queue: the ACTIVE count read under the lock includes every committed
+   * claim, so the concurrency limit holds across worker processes, and a claim
+   * can never interleave with a pause. NO KEY UPDATE does not conflict with the
+   * KEY SHARE lock that job inserts take on their queue, so submission is not blocked.
    */
   claim: ({ jobId, queueId, workerId, leaseMs }) =>
     getDatabase().transaction(async (transaction) => {
+      const [queue] = await select(
+        `SELECT status, concurrency FROM queues WHERE id = $1 FOR NO KEY UPDATE`,
+        [queueId],
+        transaction
+      );
+      if (!queue) {
+        return null;
+      }
+
+      const [state] = await select(
+        `SELECT (SELECT status FROM jobs WHERE id = $1 AND queue_id = $2) AS job_status,
+                (SELECT count(*)::int FROM jobs WHERE queue_id = $2 AND status = 'ACTIVE') AS active`,
+        [jobId, queueId],
+        transaction
+      );
+      if (state.job_status !== 'WAITING') {
+        return null;
+      }
+      if (queue.status !== 'ACTIVE') {
+        return { rejected: 'QUEUE_NOT_ACTIVE', queueStatus: queue.status };
+      }
+      if (state.active >= queue.concurrency) {
+        return { rejected: 'QUEUE_AT_CAPACITY', active: state.active, concurrency: queue.concurrency };
+      }
+
       const [job] = await select(
         `UPDATE jobs
          SET status = 'ACTIVE',
@@ -138,9 +174,28 @@ export const jobExecutionRepository = {
   },
 
   /**
-   * ACTIVE -> RETRYING (with scheduled_at = NOW() + retryDelayMs), FAILED, or DEAD.
-   * `attemptStatus` is FAILED for handler errors and INTERRUPTED when the
-   * worker gave the job up (shutdown). Returns false if the claim was fenced out.
+   * IDs of ACTIVE jobs held by this worker that a user asked to cancel.
+   * Polled by the worker so it can abort those handlers cooperatively.
+   */
+  async findCancelRequested({ workerId }) {
+    const rows = await select(
+      `SELECT id, lease_version::text AS lease_version FROM jobs
+       WHERE locked_by = $1 AND status = 'ACTIVE' AND cancel_requested_at IS NOT NULL`,
+      [workerId]
+    );
+    return rows.map((r) => ({ jobId: r.id, leaseVersion: r.lease_version }));
+  },
+
+  /**
+   * ACTIVE -> RETRYING (with scheduled_at = NOW() + retryDelayMs), FAILED,
+   * DEAD, or CANCELLED. `attemptStatus` is FAILED for handler errors,
+   * INTERRUPTED when the worker gave the job up (shutdown), and CANCELLED when
+   * the handler stopped because of a cancel request.
+   *
+   * If a cancel was requested, the job becomes CANCELLED whatever `nextStatus`
+   * says: a job the user cancelled is never retried.
+   *
+   * Returns the job's new status, or false if the claim was fenced out.
    */
   fail: (claim, { nextStatus, retryDelayMs, error, attemptStatus = 'FAILED' }) =>
     getDatabase().transaction(async (transaction) => {
@@ -152,17 +207,18 @@ export const jobExecutionRepository = {
 
       const updated = await select(
         `UPDATE jobs
-         SET status = $4::text,
-             scheduled_at = CASE WHEN $4::text = 'RETRYING'
+         SET status = CASE WHEN cancel_requested_at IS NOT NULL THEN 'CANCELLED' ELSE $4::text END,
+             scheduled_at = CASE WHEN $4::text = 'RETRYING' AND cancel_requested_at IS NULL
                                  THEN NOW() + make_interval(secs => $5::double precision / 1000)
                                  ELSE scheduled_at END,
-             completed_at = CASE WHEN $4::text IN ('FAILED', 'DEAD') THEN NOW() ELSE NULL END,
+             completed_at = CASE WHEN $4::text IN ('FAILED', 'DEAD', 'CANCELLED') OR cancel_requested_at IS NOT NULL
+                                 THEN NOW() ELSE NULL END,
              last_error = $6::jsonb,
              locked_by = NULL,
              lock_expires_at = NULL,
              updated_at = NOW()
          WHERE id = $1 AND status = 'ACTIVE' AND locked_by = $2 AND lease_version = $3
-         RETURNING id`,
+         RETURNING id, status`,
         [
           claim.jobId,
           claim.workerId,
@@ -198,6 +254,6 @@ export const jobExecutionRepository = {
         ],
         transaction
       );
-      return true;
+      return updated[0].status;
     }),
 };

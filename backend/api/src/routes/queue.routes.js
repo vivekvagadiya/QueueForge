@@ -1,5 +1,12 @@
 import { Router } from 'express';
-import { createQueue, getQueue, listQueues, updateQueue } from '../controllers/queue.controller.js';
+import {
+  createQueue,
+  getQueue,
+  listQueues,
+  pauseQueue,
+  resumeQueue,
+  updateQueue,
+} from '../controllers/queue.controller.js';
 import { listJobs, submitJob } from '../controllers/job.controller.js';
 import { requireAuth } from '../middlewares/requireAuth.js';
 import { validate } from '../middlewares/validate.js';
@@ -20,6 +27,8 @@ router.post('/', validate(createQueueSchema), asyncHandler(createQueue));
 router.get('/', validate(listQueuesSchema), asyncHandler(listQueues));
 router.get('/:queueId', validate(getQueueSchema), asyncHandler(getQueue));
 router.patch('/:queueId', validate(updateQueueSchema), asyncHandler(updateQueue));
+router.post('/:queueId/pause', validate(getQueueSchema), asyncHandler(pauseQueue));
+router.post('/:queueId/resume', validate(getQueueSchema), asyncHandler(resumeQueue));
 
 router.post('/:queueId/jobs', validate(createJobSchema), asyncHandler(submitJob));
 router.get('/:queueId/jobs', validate(listJobsSchema), asyncHandler(listJobs));
