@@ -5,6 +5,7 @@ import { useToast } from '../../components/Toasts.jsx'
 import { EmptyState, ErrorState, Pagination, Spinner, StatusBadge } from '../../components/ui.jsx'
 import { useApiQuery } from '../../hooks/useApiQuery.js'
 import { useDebouncedUrlValue, useUrlParams } from '../../hooks/useUrlParams.js'
+import { useLiveRefresh } from '../../realtime/useLiveRefresh.js'
 import { formatDateTime, shortId } from '../../utils/format.js'
 import { cancelMessage, canCancel, isCancelling, JOB_STATUSES } from './jobConstants.js'
 import { SubmitJobModal } from './SubmitJobModal.jsx'
@@ -49,6 +50,10 @@ export function JobsPage() {
       },
     }
   )
+
+  // Live updates: job changes in this queue, and changes to the queue itself.
+  useLiveRefresh((e) => e.type === 'job' && e.queueId === queueId, jobs.refresh)
+  useLiveRefresh((e) => e.type === 'queue' && e.id === queueId, queue.refresh)
 
   const cancel = async (job) => {
     const running = job.status === 'ACTIVE'

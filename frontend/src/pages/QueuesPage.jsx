@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { queuesApi } from '../api/endpoints.js'
 import { useToast } from '../components/Toasts.jsx'
 import { EmptyState, ErrorState, Pagination, Spinner, StatusBadge } from '../components/ui.jsx'
+import { useLiveRefresh } from '../realtime/useLiveRefresh.js'
 import { formatDateTime } from '../utils/format.js'
 import { QueueFormModal } from './QueueFormModal.jsx'
 
@@ -85,6 +86,19 @@ export function QueuesPage() {
   }, [page, status, search, requestKey, updateParams])
 
   const reload = () => setReloadKey((k) => k + 1)
+
+  // Live updates: any change to one of the user's queues reloads the current
+  // view quietly (no dimming); the result is applied only if the view is unchanged.
+  const refreshQuietly = () => {
+    const key = requestKey
+    queuesApi
+      .list({ page, limit: PAGE_SIZE, status, search })
+      .then((res) => setResult((r) => (r.key === key ? { key, error: null, data: res.data, meta: res.meta } : r)))
+      .catch(() => {
+        /* keep current rows; Refresh or the next event retries */
+      })
+  }
+  useLiveRefresh((e) => e.type === 'queue', refreshQuietly)
 
   /** Replaces a row with the queue the API returned (persisted state). */
   const applySaved = (saved) =>

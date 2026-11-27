@@ -1,10 +1,13 @@
+import { useEffect, useState } from 'react'
 import { workersApi } from '../api/endpoints.js'
+import { useLiveRefresh } from '../realtime/useLiveRefresh.js'
 import { EmptyState, ErrorState, Pagination, Spinner, StatusBadge } from '../components/ui.jsx'
 import { useApiQuery } from '../hooks/useApiQuery.js'
 import { useUrlParams } from '../hooks/useUrlParams.js'
 import { formatAge, formatDateTime } from '../utils/format.js'
 
 const PAGE_SIZE = 20
+const AGE_TICK_MS = 5000
 const STATUSES = ['RUNNING', 'DRAINING', 'UNHEALTHY', 'STARTING', 'STOPPED']
 
 const STATUS_HELP = {
@@ -42,6 +45,17 @@ export function WorkersPage() {
   const workers = useApiQuery(JSON.stringify(['workers', page, status]), (signal) =>
     workersApi.list({ page, limit: PAGE_SIZE, status }, { signal })
   )
+  // Live updates on worker status / active-job changes. Heartbeats themselves
+  // aren't pushed, so ages advance locally between reloads.
+  useLiveRefresh((e) => e.type === 'worker', workers.refresh, { delayMs: 500 })
+  const [now, setNow] = useState(null)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), AGE_TICK_MS)
+    return () => clearInterval(timer)
+  }, [])
+  const elapsed = now && workers.receivedAt ? Math.max(0, now - workers.receivedAt) : 0
+  const heartbeatAge = (w) => (w.heartbeatAgeMs === null ? null : w.heartbeatAgeMs + elapsed)
+
   const rows = workers.data ?? []
   const counts = workers.meta?.statusCounts ?? {}
   const totalAll = Object.values(counts).reduce((a, b) => a + b, 0)
@@ -135,7 +149,7 @@ export function WorkersPage() {
                       <Capacity active={w.status === 'STOPPED' ? 0 : w.activeJobs} total={w.concurrency} />
                     </td>
                     <td title={w.lastHeartbeatAt ? new Date(w.lastHeartbeatAt).toLocaleString() : undefined}>
-                      {formatAge(w.heartbeatAgeMs)}
+                      {w.status === 'STOPPED' ? '—' : formatAge(heartbeatAge(w))}
                     </td>
                     <td className="cell-sub">{queuesLabel(w)}</td>
                     <td className="cell-sub">

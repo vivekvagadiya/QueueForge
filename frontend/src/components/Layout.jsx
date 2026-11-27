@@ -1,6 +1,26 @@
 import { useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
+import { useRealtime } from '../realtime/RealtimeProvider.jsx'
+
+const LIVE_LABELS = {
+  live: ['Live', 'Updates appear automatically.'],
+  connecting: ['Connecting…', 'Connecting for live updates.'],
+  reconnecting: ['Reconnecting…', 'Live updates paused; data reloads when the connection returns.'],
+  off: ['Live updates off', 'Use Refresh to load the latest data.'],
+}
+
+/** Real-time connection state. Pages always work without it (Refresh / reload). */
+function LiveIndicator() {
+  const { status } = useRealtime()
+  const [label, help] = LIVE_LABELS[status] ?? LIVE_LABELS.off
+  return (
+    <span className={`live-indicator live-${status}`} title={help} role="status">
+      <span className="live-dot" aria-hidden="true" />
+      {label}
+    </span>
+  )
+}
 
 const NAV = [
   { to: '/queues', label: 'Queues' },
@@ -46,6 +66,7 @@ export function Layout() {
           >
             ☰
           </button>
+          <LiveIndicator />
           <div className="topbar-user">
             <span className="user-name" title={user?.email}>
               {user?.name}

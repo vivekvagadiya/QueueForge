@@ -8,6 +8,7 @@ import { LoginPage, RegisterPage } from './pages/AuthPages.jsx'
 import { JobDetailPage } from './pages/jobs/JobDetailPage.jsx'
 import { JobsPage } from './pages/jobs/JobsPage.jsx'
 import { QueuesPage } from './pages/QueuesPage.jsx'
+import { RealtimeProvider } from './realtime/RealtimeProvider.jsx'
 import { WorkersPage } from './pages/WorkersPage.jsx'
 
 function NotFoundPage() {
@@ -43,9 +44,11 @@ export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <ToastProvider>
-          <AppRoutes />
-        </ToastProvider>
+        <RealtimeProvider>
+          <ToastProvider>
+            <AppRoutes />
+          </ToastProvider>
+        </RealtimeProvider>
       </AuthProvider>
     </BrowserRouter>
   )

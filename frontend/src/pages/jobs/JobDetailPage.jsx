@@ -4,6 +4,7 @@ import { jobsApi, queuesApi } from '../../api/endpoints.js'
 import { useToast } from '../../components/Toasts.jsx'
 import { EmptyState, ErrorState, Spinner, StatusBadge } from '../../components/ui.jsx'
 import { useApiQuery } from '../../hooks/useApiQuery.js'
+import { useLiveRefresh } from '../../realtime/useLiveRefresh.js'
 import { formatDuration, formatTimestamp, prettyJson, shortId } from '../../utils/format.js'
 import { cancelMessage, canCancel, isCancelling } from './jobConstants.js'
 
@@ -66,6 +67,9 @@ export function JobDetailPage() {
   const queue = useApiQuery(`queue:${queueId ?? ''}`, (signal) =>
     queueId ? queuesApi.get(queueId, { signal }) : Promise.resolve({ data: null })
   )
+
+  // Live updates: any change of this job (status, attempts, cancel progress).
+  useLiveRefresh((e) => e.type === 'job' && e.id === jobId, job.refresh)
 
   const cancel = async () => {
     const j = job.data

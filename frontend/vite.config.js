@@ -18,6 +18,8 @@ export default defineConfig(({ mode }) => {
       // (no CORS in development). Configure the target with VITE_API_PROXY_TARGET.
       proxy: {
         '/api': { target: proxyTarget, changeOrigin: true },
+        // Socket.IO (Sprint 6C): HTTP long-polling plus the WebSocket upgrade.
+        '/socket.io': { target: proxyTarget, changeOrigin: true, ws: true },
       },
     },
     test: {
