@@ -45,6 +45,37 @@ export const workerRepository = {
   },
 
   /**
+   * Dashboard listing (read-only). Live workers first (anything not STOPPED),
+   * then most recent heartbeat. `heartbeat_age_ms` is computed with PostgreSQL
+   * NOW() so the browser's clock doesn't matter.
+   */
+  async list({ statuses, limit, offset }) {
+    const where = statuses ? `WHERE status = ANY($1::text[])` : '';
+    const bind = statuses ? [statuses] : [];
+    const page = `LIMIT ${Number(limit)} OFFSET ${Number(offset)}`;
+    const db = getDatabase();
+    const [rows, [{ total }], counts] = await Promise.all([
+      db.query(
+        `SELECT id, name, hostname, process_id, status, concurrency, active_jobs, queues,
+                last_heartbeat_at, started_at, stopped_at,
+                ROUND(EXTRACT(EPOCH FROM NOW() - last_heartbeat_at) * 1000)::bigint AS heartbeat_age_ms
+         FROM workers ${where}
+         ORDER BY (status = 'STOPPED'), last_heartbeat_at DESC NULLS LAST, started_at DESC
+         ${page}`,
+        { bind, type: QueryTypes.SELECT }
+      ),
+      db.query(`SELECT COUNT(*)::int AS total FROM workers ${where}`, { bind, type: QueryTypes.SELECT }),
+      // Counts per status over all workers (unfiltered), for the page summary.
+      db.query(`SELECT status, COUNT(*)::int AS n FROM workers GROUP BY status`, { type: QueryTypes.SELECT }),
+    ]);
+    return {
+      rows,
+      total,
+      statusCounts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
+    };
+  },
+
+  /**
    * System-level queue discovery for workers configured with WORKER_QUEUES="*".
    * Deliberately not user-scoped: workers serve every tenant.
    *

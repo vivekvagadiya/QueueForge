@@ -2,6 +2,14 @@ import { Op, QueryTypes } from 'sequelize';
 import { getDatabase } from '../config/database.js';
 import { Job, JobAttempt, Queue } from '../models/index.js';
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Name contains `search` (LIKE wildcards escaped), or the job ID equals it. */
+const searchCondition = (search) => {
+  const byName = { name: { [Op.iLike]: `%${search.replace(/[\\%_]/g, '\\$&')}%` } };
+  return UUID.test(search) ? { [Op.or]: [byName, { id: search }] } : byName;
+};
+
 /**
  * Job reads are scoped to the owning user, either directly (join through
  * queues.user_id) or through a queue the caller has already been verified to own.
@@ -51,9 +59,13 @@ export const jobRepository = {
     }),
 
   /** `queueId` must come from a queue already verified as owned by the caller. */
-  listForQueue: ({ queueId, statuses, limit, offset }) =>
+  listForQueue: ({ queueId, statuses, search, limit, offset }) =>
     Job.findAndCountAll({
-      where: { queueId, ...(statuses ? { status: { [Op.in]: statuses } } : {}) },
+      where: {
+        queueId,
+        ...(statuses ? { status: { [Op.in]: statuses } } : {}),
+        ...(search ? searchCondition(search) : {}),
+      },
       order: [
         ['createdAt', 'DESC'],
         ['id', 'DESC'],

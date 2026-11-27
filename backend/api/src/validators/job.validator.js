@@ -33,7 +33,11 @@ export const createJobSchema = {
 
 export const listJobsSchema = {
   params: queueIdParams,
-  query: paginationQuery.extend({ status: statusListQuery(JOB_STATUSES) }),
+  query: paginationQuery.extend({
+    status: statusListQuery(JOB_STATUSES),
+    // Job name contains (case-insensitive), or an exact job ID.
+    search: z.string().trim().max(255).optional().transform((v) => v || undefined),
+  }),
 };
 
 export const getJobSchema = { params: z.object({ jobId: uuid }) };

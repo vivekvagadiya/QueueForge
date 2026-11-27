@@ -105,11 +105,12 @@ export const jobService = {
     return assertSameRequest(existing, input);
   },
 
-  async list({ userId, queueId, page, limit, status }) {
+  async list({ userId, queueId, page, limit, status, search }) {
     await getOwnedQueue({ userId, queueId });
     const { rows, count } = await jobRepository.listForQueue({
       queueId,
       statuses: status,
+      search,
       limit,
       offset: (page - 1) * limit,
     });
