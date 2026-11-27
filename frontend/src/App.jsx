@@ -5,23 +5,10 @@ import { Layout } from './components/Layout.jsx'
 import { ToastProvider } from './components/Toasts.jsx'
 import { EmptyState } from './components/ui.jsx'
 import { LoginPage, RegisterPage } from './pages/AuthPages.jsx'
+import { JobDetailPage } from './pages/jobs/JobDetailPage.jsx'
+import { JobsPage } from './pages/jobs/JobsPage.jsx'
 import { QueuesPage } from './pages/QueuesPage.jsx'
-
-function WorkersPage() {
-  return (
-    <section>
-      <div className="page-header">
-        <div>
-          <h1>Workers</h1>
-          <p className="muted">Worker health, active jobs and heartbeats.</p>
-        </div>
-      </div>
-      <EmptyState title="Coming in Sprint 6B">
-        Worker visibility needs the read-only workers endpoint, which is part of the next increment.
-      </EmptyState>
-    </section>
-  )
-}
+import { WorkersPage } from './pages/WorkersPage.jsx'
 
 function NotFoundPage() {
   return (
@@ -42,6 +29,8 @@ export function AppRoutes() {
         <Route element={<Layout />}>
           <Route index element={<Navigate to="/queues" replace />} />
           <Route path="/queues" element={<QueuesPage />} />
+          <Route path="/queues/:queueId/jobs" element={<JobsPage />} />
+          <Route path="/jobs/:jobId" element={<JobDetailPage />} />
           <Route path="/workers" element={<WorkersPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>

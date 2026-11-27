@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { queuesApi } from '../api/endpoints.js'
 import { useToast } from '../components/Toasts.jsx'
 import { EmptyState, ErrorState, Pagination, Spinner, StatusBadge } from '../components/ui.jsx'
@@ -212,7 +212,9 @@ export function QueuesPage() {
                 {data.map((queue) => (
                   <tr key={queue.id}>
                     <td>
-                      <div className="cell-title">{queue.name}</div>
+                      <Link to={`/queues/${queue.id}/jobs`} className="cell-title">
+                        {queue.name}
+                      </Link>
                       {queue.description && <div className="cell-sub">{queue.description}</div>}
                     </td>
                     <td>
@@ -236,6 +238,13 @@ export function QueuesPage() {
                           {queue.status === 'ACTIVE' ? 'Pause' : 'Resume'}
                         </button>
                       )}
+                      <Link
+                        className="button button-small"
+                        to={`/queues/${queue.id}/jobs`}
+                        aria-label={`Jobs in ${queue.name}`}
+                      >
+                        Jobs
+                      </Link>
                       <button
                         type="button"
                         className="button button-small"
