@@ -18,8 +18,10 @@
 - [x] Workers consume streams and execute jobs.
 - [x] Leases, heartbeat, retry release, and crash recovery.
 - [x] Scheduled release, queue pause/resume, cooperative cancellation, queue concurrency limits, and retention.
+- [x] React dashboard with real-time updates (Sprint 6).
+- [x] Structured logs with correlation IDs, Prometheus metrics, and health/readiness for every process (Sprint 7A).
 
-**Immediate next step:** Sprint 6: React dashboard and real-time visibility.
+**Immediate next step:** Sprint 7B: testing, load testing and query tuning.
 
 ### Schema notes (Sprint 0)
 - Migrations live in `backend/api/src/database/migrations/`; applied migrations are tracked in `schema_migrations`.
@@ -105,12 +107,14 @@ All routes are under `/api/v1`. Everything except `auth/register` and `auth/logi
 | GET | `/jobs/:jobId` | Job plus attempt history |
 | GET | `/workers` | Sprint 6B. `?page&limit&status=RUNNING,UNHEALTHY`; read-only worker health, with `meta.statusCounts` |
 | POST | `/jobs/:jobId/cancel` | Sprint 5. `200` when the job is cancelled, or `202` when a running job was asked to stop (it stays `ACTIVE`). `409 JOB_NOT_CANCELLABLE` once finished |
+| GET | `/health`, `/health/live`, `/health/ready` | Sprint 7A, no auth. `ready` returns `503` unless PostgreSQL answers |
+| GET | `/metrics` (root, not `/api/v1`) | Sprint 7A. Prometheus format; requires `Bearer <METRICS_TOKEN>` when that is set |
 
 Behavior notes:
 - Another user's queue or job returns `404`, the same as a missing one, so IDs don't reveal what exists.
 - Idempotency keys are unique per queue. A replay returns `200` with the original job and `Idempotent-Replayed: true`. Reusing a key with a different `name` or `payload` returns `409 IDEMPOTENCY_KEY_CONFLICT`.
 - `ARCHIVED` queues reject new jobs (`409`). `PAUSED` queues still accept them; pausing only stops dispatch.
-- Errors always have the shape `{ success: false, error: { code, message, details? } }`.
+- Errors always have the shape `{ success: false, error: { code, message, details?, requestId } }`. `requestId` (Sprint 7A) matches the `X-Request-Id` response header and the server logs.
 - Tests: `npm test` runs the integration suite against `queueforge_test`, which is created automatically. Set `TEST_DATABASE_URL` to use a different database; its name must end in `_test`.
 
 ## Sprint 2 — Redis Streams and transactional outbox
@@ -383,17 +387,91 @@ Behavior notes:
 
 ## Sprint 7 — Observability, testing, and production hardening
 
-**Goal:** Validate correctness under failure and load.
+**Goal:** Validate correctness under failure and load. Divided into 3 incremental parts so each part stays focused and easy to verify.
 
-### Tasks
-- [ ] Add structured logs and correlation IDs across API, publisher, and worker.
-- [ ] Add metrics for queue depth, waiting age, execution duration, retries, failures, worker utilization, and publisher lag.
-- [ ] Add health/readiness endpoints.
-- [ ] Add unit, integration, end-to-end, race, and fault-injection tests.
+### Sprint 7A — Observability & Health Checks
+- [x] Add structured logs and correlation IDs across API, publisher, worker, and recovery.
+- [x] Add metrics for queue depth, waiting age, execution duration, retries, failures, worker utilization, and publisher lag.
+- [x] Add health/readiness endpoints (PostgreSQL & Redis connectivity checks).
+
+#### How it works (Sprint 7A)
+
+**Structured logs**
+- All four processes write JSON lines with pino.
+- Every line carries `service`, `role` (`api`, `publisher`, `worker`, `recovery`; taken from the entry script), `pid`, `hostname` and, when there is one, `correlationId`.
+- Secrets are redacted: `authorization` and `cookie` headers, `password` and `token` fields.
+- morgan was removed. The API writes one access line per request: method, path, route, status, duration and user ID. Health and metrics requests are logged at `debug`.
+
+**Correlation IDs**
+- The ID lives in an AsyncLocalStorage context (`src/observability/context.js`). The logger adds it to every line written inside that context, including lines from repositories, job handlers and lease timers.
+- Where IDs come from:
+  - **API request:** the caller's `X-Request-Id` if it is well formed (`[A-Za-z0-9._:-]`, up to 128 characters), otherwise a new UUID. It is returned in the `X-Request-Id` response header and as `error.requestId` in error bodies.
+  - **Publisher cycle, recovery pass, retention pass:** a new ID each time.
+  - **Worker stream entry:** the ID carried by the entry.
+- **Across processes:** the ID that created an outbox event is saved on it in the new `outbox_events.correlation_id` column (migration `20261129000009`). The publisher copies it into the stream entry as the `correlationId` field, and the worker handles that entry under it.
+- **Result:** a job's submit request, its publish failures and its worker attempt all log the same ID. Jobs released by the scheduler or after a retry carry the ID of the recovery pass that released them.
+
+**Metrics**
+Prometheus format via prom-client. Every process labels its metrics with `role` and includes Node process metrics (`queueforge_process_*`, `queueforge_nodejs_*`).
+
+| Metric | Process | What it measures |
+|---|---|---|
+| `queueforge_http_request_duration_seconds{method,route,status_code}` | api | Request latency. In `route`, UUID path segments become `:id` and unmatched paths become `unmatched`, so labels stay bounded |
+| `queueforge_queue_jobs{queue_id,status}` | api (from PostgreSQL) | Non-terminal jobs per queue. Queue depth is the `status="WAITING"` series |
+| `queueforge_queue_oldest_waiting_age_seconds{queue_id}` | api (from PostgreSQL) | Waiting age: how long the oldest `WAITING` job has waited |
+| `queueforge_workers{status}` | api (from PostgreSQL) | Number of registered workers in each status |
+| `queueforge_cluster_worker_active_jobs`, `_capacity`, `_utilization_ratio` | api (from PostgreSQL) | Cluster-wide utilization: jobs running on serving workers (from heartbeats) against their total concurrency |
+| `queueforge_outbox_events{status}`, `queueforge_outbox_oldest_unpublished_age_seconds` | api (from PostgreSQL) | Outbox backlog, i.e. publisher lag as seen from the database |
+| `queueforge_cluster_metrics_up` | api | `0` when the PostgreSQL snapshot failed; the gauges above are then left out |
+| `queueforge_outbox_events_total{result}` | publisher | Events `published`, `failed` (will be retried) or `lost` (claim taken over) |
+| `queueforge_outbox_publish_lag_seconds` | publisher | Time from commit to stream entry: age at claim (PostgreSQL clock) plus local time since the claim, so clock skew doesn't distort it |
+| `queueforge_job_attempts_total{queue_id,outcome}` | worker | Finished attempts. Retries are `outcome="retrying"`; failures are `failed` and `dead`. Other outcomes: `completed`, `cancelled`, `interrupted`, `lease_lost`, `fenced`, `persist_error` |
+| `queueforge_job_execution_duration_seconds{queue_id,outcome}` | worker | Attempt duration, from claim to outcome |
+| `queueforge_worker_stream_entries_total{outcome,acked}` | worker | Every stream entry handled, including discarded and deferred ones |
+| `queueforge_worker_running_jobs`, `_concurrency`, `_utilization_ratio`, `_deferred_entries` | worker | Utilization of this worker |
+| `queueforge_recovery_actions_total{action,next_status}` | recovery | `lease_recovered`, `scheduled_released`, `retry_released`, `worker_unhealthy` |
+| `queueforge_retention_deleted_total{kind}` | recovery | Rows and stream data removed by retention |
+
+- **Cluster gauges come from the API, not the workers.** They are computed from PostgreSQL at scrape time with four aggregate queries, so their values don't depend on which processes are scraped.
+  - The snapshot is shared by every gauge in a scrape and reused for `METRICS_CACHE_MS` (default 5 s), so extra scrapers don't add database load.
+  - Scrape one API instance for them.
+  - Only non-terminal jobs are counted. Finished work is measured by the workers' counters.
+- **Protecting `/metrics`:** set `METRICS_TOKEN` to require `Authorization: Bearer <token>`. Without it, keep `/metrics` off public networks.
+
+**Health and readiness**
+
+| Process | Liveness | Readiness | Critical checks | Reported only |
+|---|---|---|---|---|
+| API (on `PORT`) | `/api/v1/health/live` | `/api/v1/health/ready` | PostgreSQL | Redis, realtime listener |
+| Publisher | `/health/live` | `/health/ready` | PostgreSQL, Redis (PING), publisher loop running | — |
+| Worker | `/health/live` | `/health/ready` | PostgreSQL, Redis commands connection (PING), reader connection state, worker `RUNNING` | — |
+| Recovery | `/health/live` | `/health/ready` | PostgreSQL, recovery loop running | Redis (only used for stream trimming) |
+
+- **Liveness** never checks dependencies, so a brief database outage doesn't get every process restarted.
+- **Readiness** returns `200` with status `ok`, or `degraded` when only a reported-only check fails. It returns `503` with `unavailable` when a critical check fails, and with `shutting_down` once a stop signal arrives, so load balancers drain the process first.
+- **Check limits:** each check times out after `HEALTH_CHECK_TIMEOUT_MS` (default 2 s). Responses show only a short error code such as `NOT_CONNECTED`, `TIMEOUT` or `ECONNREFUSED`. The full error is logged once, when a check changes state.
+- **The worker's reader connection** sits in a blocking `XREADGROUP`, so readiness checks only its connection state; the PING goes through the commands connection.
+- **Ops server for the other processes:** the publisher, workers and recovery serve these endpoints on `OPS_PORT` (optional, unset by default). Give each process on a host its own port.
+  - A worker starts its ops server before registering, so a port already in use fails at startup without leaving a worker row behind.
+- `/api/v1/health` keeps its old response for compatibility.
+
+**Setup**
+- Run `npm run db:migrate` (migration 009).
+- New environment variables: `OPS_PORT`, `OPS_HOST`, `METRICS_TOKEN`, `METRICS_CACHE_MS` and `HEALTH_CHECK_TIMEOUT_MS` (see `.env.example`).
+- New dependency: `prom-client`. npm marks it deprecated in favour of `@prometheus-io/client` (same API); switching only changes the import in `src/observability/metrics.js`.
+
+**Not covered yet**
+- Per CLAUDE.md, this increment added no tests. It was verified with `node --check` and the migration only.
+- The cluster snapshot queries have not been run through `EXPLAIN`; that is Sprint 7B.
+
+### Sprint 7B — Testing, Load Testing & Query Tuning
+- [ ] Add unit, integration, end-to-end, race, and fault-injection tests (including Sprint 6B/6C coverage when requested).
 - [ ] Load-test throughput, latency, recovery time, and database connection usage.
 - [ ] Inspect critical queries with `EXPLAIN (ANALYZE, BUFFERS)` and tune indexes from measured plans.
-- [ ] Add Docker Compose services for API, publisher, scheduler, recovery, workers, PostgreSQL, and Redis.
-- [ ] Add CI checks for linting, tests, and migration validation.
+
+### Sprint 7C — Docker Compose, CI & Production Runbooks
+- [ ] Add Docker Compose services for API, publisher, recovery (scheduler), workers, frontend, PostgreSQL, and Redis.
+- [ ] Add CI checks for linting, tests, and migration validation against a fresh database.
 - [ ] Document environment variables, setup, migrations, deployment, backup/restore, and recovery runbooks.
 
 ### Acceptance criteria
@@ -406,10 +484,12 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Sprint 7: structured logs with correlation IDs across API, publisher, worker and recovery.
-2. [ ] Metrics: queue depth, waiting age, execution duration, retries, failures, worker utilization, publisher lag.
-3. [ ] Health/readiness endpoints for every process, and Docker Compose services for all of them.
-4. [ ] Tests for Sprint 6B/6C (workers endpoint, jobs search, notify triggers, socket auth and routing), which were deferred under the CLAUDE.md no-tests rule.
+1. [x] Sprint 7A: structured logs with correlation IDs, Prometheus metrics, and health/readiness for every process.
+2. [ ] Sprint 7B: tests, including the deferred Sprint 6B/6C/7A coverage:
+   - 6B/6C: workers endpoint, jobs search, notify triggers, socket auth and routing.
+   - 7A: correlation propagation from API to outbox to stream to worker, readiness status codes, metrics output.
+3. [ ] Sprint 7B: load tests, and `EXPLAIN (ANALYZE, BUFFERS)` on the hot queries, including the 7A cluster metrics snapshot.
+4. [ ] Sprint 7C: Docker Compose for every process, using the 7A readiness endpoints as healthchecks; CI; runbooks.
 5. [ ] Optional: per-queue job counts by status on the Queues page.
 
 ## Definition of done for each sprint
