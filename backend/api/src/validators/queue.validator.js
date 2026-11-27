@@ -31,7 +31,11 @@ export const createQueueSchema = {
 };
 
 export const listQueuesSchema = {
-  query: paginationQuery.extend({ status: statusListQuery(QUEUE_STATUSES) }),
+  query: paginationQuery.extend({
+    status: statusListQuery(QUEUE_STATUSES),
+    // Case-insensitive substring match on the queue name.
+    search: z.string().trim().max(100).optional().transform((v) => v || undefined),
+  }),
 };
 
 export const getQueueSchema = { params: queueIdParams };

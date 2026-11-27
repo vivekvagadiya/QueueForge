@@ -114,6 +114,26 @@ describe('queue CRUD', () => {
     assert.equal(badFilter.status, 400);
   });
 
+  test('searches queue names case-insensitively, treating wildcards literally', async () => {
+    const created = {};
+    for (const name of ['Email-Send', 'email_digest', 'sms', 'emailXdigest']) {
+      created[name] = await createQueue(owner.auth, { name });
+    }
+    await createQueue(other.auth, { name: 'email-other' });
+    const names = async (qs) =>
+      (await request(app).get(`/api/v1/queues?${qs}`).set('Authorization', owner.auth)).body.data
+        .map((q) => q.name)
+        .sort();
+
+    assert.deepEqual(await names('search=EMAIL'), ['Email-Send', 'emailXdigest', 'email_digest']);
+    assert.deepEqual(await names('search=email_'), ['email_digest'], '_ is not a wildcard');
+    assert.deepEqual(await names('search=%25'), [], '% is not a wildcard');
+    assert.deepEqual(await names('search='), ['Email-Send', 'emailXdigest', 'email_digest', 'sms']);
+
+    await request(app).post(`/api/v1/queues/${created.sms.id}/pause`).set('Authorization', owner.auth);
+    assert.deepEqual(await names('search=s&status=PAUSED'), ['sms'], 'combines with the status filter');
+  });
+
   test('gets and updates an owned queue', async () => {
     const queue = await createQueue(owner.auth, { name: 'reports' });
 

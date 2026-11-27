@@ -36,10 +36,11 @@ export const queueService = {
     }
   },
 
-  async list({ userId, page, limit, status }) {
+  async list({ userId, page, limit, status, search }) {
     const { rows, count } = await queueRepository.listForUser({
       userId,
       statuses: status,
+      search,
       limit,
       offset: (page - 1) * limit,
     });

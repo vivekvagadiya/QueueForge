@@ -18,9 +18,14 @@ export const queueRepository = {
       transaction,
     }),
 
-  listForUser: ({ userId, statuses, limit, offset }) =>
+  listForUser: ({ userId, statuses, search, limit, offset }) =>
     Queue.findAndCountAll({
-      where: { userId, ...(statuses ? { status: { [Op.in]: statuses } } : {}) },
+      where: {
+        userId,
+        ...(statuses ? { status: { [Op.in]: statuses } } : {}),
+        // Escape LIKE wildcards so the search is a literal substring match.
+        ...(search ? { name: { [Op.iLike]: `%${search.replace(/[\\%_]/g, '\\$&')}%` } } : {}),
+      },
       order: [
         ['createdAt', 'DESC'],
         ['id', 'DESC'],
