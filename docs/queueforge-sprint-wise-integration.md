@@ -96,7 +96,7 @@ All routes are under `/api/v1`. Everything except `auth/register` and `auth/logi
 | POST | `/auth/login` | `{ email, password }` → user + access token |
 | GET | `/auth/me` | Current user |
 | POST | `/queues` | `{ name, description?, concurrency?, defaultJobOptions?: { maxAttempts?, priority? } }` |
-| GET | `/queues` | `?page&limit&status=ACTIVE,PAUSED` |
+| GET | `/queues` | `?page&limit&status=ACTIVE,PAUSED&search=mail` (`search`: name contains, case-insensitive; Sprint 6A) |
 | GET / PATCH | `/queues/:queueId` | PATCH accepts any create field plus `status`; `defaultJobOptions` is replaced whole |
 | POST | `/queues/:queueId/pause` | Stop dispatching (Sprint 5). Idempotent; `409 QUEUE_ARCHIVED` for archived queues |
 | POST | `/queues/:queueId/resume` | Resume dispatch and re-announce waiting jobs (Sprint 5). Idempotent; `409` for archived queues |
@@ -275,14 +275,49 @@ Behavior notes:
 
 ## Sprint 6 — Dashboard and real-time visibility
 
-**Goal:** Expose queue operations and job execution status.
+**Goal:** Expose queue operations and job execution status. Divided into 3 incremental parts so each part stays small, testable, and easy to verify.
 
-### Tasks
-- [ ] Build React dashboard pages for queues, jobs, attempts, and workers.
-- [ ] Add Socket.IO updates for job and worker state changes.
-- [ ] Persist state first, then emit real-time events.
-- [ ] Ensure dashboard data can always be reloaded from API/PostgreSQL.
-- [ ] Add search, filters, pagination, and useful empty/error states.
+### Sprint 6A — Auth, App Shell, and Queues Management
+- [x] Set up frontend routing, API client (JWT attach + 401 handling), and Login/Register pages.
+- [x] Build main dashboard layout (sidebar/header, navigation between Queues and Workers, logout).
+- [x] Build Queues page: list queues with search, status filter (`ACTIVE`, `PAUSED`, `ARCHIVED`), pagination, and empty/error states.
+- [x] Add queue actions: create queue, edit queue, pause, and resume.
+
+#### How it works (Sprint 6A)
+- **Stack:** React 19 + Vite, React Router 7, and plain CSS with light/dark tokens (`src/index.css`). There is no state library: pages fetch from the API directly. Tests use Vitest, Testing Library and jsdom.
+- **Run it:** start the API (`backend/api`: `npm run dev`), then in `frontend/` run `npm run dev` and open `http://localhost:5173`.
+  - The Vite dev server proxies `/api` to `http://localhost:4000` (override with `VITE_API_PROXY_TARGET`), so the browser talks to a single origin.
+  - For a separately hosted build, set `VITE_API_BASE_URL` (for example `https://api.example.com/api/v1`) and add that origin to the API's `CORS_ORIGIN`.
+- **API client** (`src/api/client.js`):
+  - Attaches `Authorization: Bearer <token>`.
+  - Turns every failure into an `ApiError` with the API's `code`, `message` and `details`. Network failures get `NETWORK_ERROR`. `fieldErrors()` maps validation details to form fields.
+  - A 401 on an authenticated request clears the token and ends the session. A 401 from login does not.
+- **Session** (`src/auth/AuthContext.jsx`):
+  - The token is kept in `localStorage`, falling back to memory if storage is blocked.
+  - On load, `GET /auth/me` restores the user, so refreshing keeps the session while the token is valid.
+  - Signed-out users are sent to `/login` and returned to the page they asked for, including its query string. An expired token shows "Your session has ended".
+  - There is no refresh token: the user signs in again when `JWT_EXPIRES_IN` runs out.
+- **Queues page:**
+  - Search, status filter and page live in the URL (`/queues?status=PAUSED&search=mail&page=2`). Refreshing or sharing the link restores the same view from the API. Search is debounced by 300 ms.
+  - Pause, resume and edit replace the row with the queue the API returned, so the UI only shows persisted state.
+  - Create and edit validate on the client with the same rules as the server. Server errors such as `QUEUE_NAME_TAKEN` or validation details appear on the matching field.
+  - Edit sends only the changed fields. Archiving is done through the edit dialog's status field.
+- **Backend change:** `GET /queues` accepts `search` (case-insensitive substring match on the name, with `%` and `_` treated literally). It can be combined with `status`.
+- **Workers page:** a placeholder until the workers endpoint arrives in 6B.
+- **Tests:** `npm test` in `frontend/` runs 24 tests: the API client, form rules, auth flows (login redirect-back, register errors, session restore, logout, expiry mid-session), and the Queues page (filters in the URL, refresh restore, pagination, pause/resume, create/edit errors, empty/error states). On Windows, run them from PowerShell or cmd. From Git Bash, a lowercase drive letter in the working directory (`c:\`) makes Vitest load itself twice and fail with "failed to find the current suite".
+
+### Sprint 6B — Jobs, Attempts, and Workers Visibility
+- [ ] Backend: add read-only `GET /api/v1/workers` endpoint to expose worker status, concurrency, active jobs, and last heartbeat.
+- [ ] Build Jobs page (per queue): list jobs with search, status filters, pagination, and empty/error states.
+- [ ] Add job actions: submit new job (payload JSON, delay/schedule, priority, max attempts, idempotency key) and cancel job (`WAITING`/`SCHEDULED`/`RETRYING` or cooperative `ACTIVE`).
+- [ ] Build Job Detail & Attempts view: inspect payload, result, error details, and full `job_attempts` timeline.
+- [ ] Build Workers page: inspect worker health (`RUNNING`, `DRAINING`, `UNHEALTHY`, `STOPPED`), active job count, and heartbeat timestamps.
+- [ ] Ensure refreshing any page restores the exact persisted state from API/PostgreSQL.
+
+### Sprint 6C — Real-time Updates (Socket.IO)
+- [ ] Backend: integrate Socket.IO on the API server (authenticated) and emit job/worker state change events **only after** state is persisted in PostgreSQL.
+- [ ] Frontend: connect `socket.io-client` to update queues, jobs, attempts, and worker health live without page refresh.
+- [ ] Keep Socket.IO strictly as an enhancement — reconnects/refreshes always fall back to API/PostgreSQL as the source of truth.
 
 ### Acceptance criteria
 - [ ] Users can inspect queues, jobs, attempts, and worker health.
@@ -314,11 +349,11 @@ Behavior notes:
 
 ## Recommended next-session checklist
 
-1. [ ] Scaffold the React dashboard (`frontend/`) with auth against the existing API.
-2. [ ] Read-only API for the dashboard that isn't there yet: list workers (status, heartbeat, active jobs) and queue stats (counts per job status).
-3. [ ] Pages: queues (with pause/resume), jobs per queue (filters, pagination, cancel), job detail with attempts, workers.
-4. [ ] Socket.IO: emit job/worker state changes only after they are committed. The dashboard must work fully without the socket (reload from the API).
-5. [ ] Decide where events come from (e.g. an outbox event type, or PostgreSQL `LISTEN/NOTIFY`) so real-time updates never come before the committed state.
+1. [ ] Sprint 6B backend: `GET /workers` (status, concurrency, active jobs, last heartbeat). Workers are system-wide, not user-owned, so decide what a user may see. Possibly per-queue job counts by status for the Queues page.
+2. [ ] Jobs page per queue (`/queues/:queueId/jobs`): search (the jobs list needs a `search` param too, e.g. on name or ID), status filters and pagination in the URL, like the Queues page.
+3. [ ] Submit-job dialog (payload JSON, delay or schedule, priority, max attempts, idempotency key) and cancel (`200` vs `202` cooperative).
+4. [ ] Job detail with the attempts timeline, and the Workers page.
+5. [ ] Sprint 6C: decide where events come from (for example an outbox event type, or PostgreSQL `LISTEN/NOTIFY`) so real-time updates never come before the committed state.
 
 ## Definition of done for each sprint
 
