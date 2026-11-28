@@ -1,16 +1,23 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { jobsApi, queuesApi } from '../../api/endpoints.js'
+import { Modal } from '../../components/Modal.jsx'
 import { useToast } from '../../components/Toasts.jsx'
 import { EmptyState, ErrorState, Pagination, Spinner, StatusBadge } from '../../components/ui.jsx'
 import { useApiQuery } from '../../hooks/useApiQuery.js'
 import { useDebouncedUrlValue, useUrlParams } from '../../hooks/useUrlParams.js'
 import { useLiveRefresh } from '../../realtime/useLiveRefresh.js'
-import { formatDateTime, shortId } from '../../utils/format.js'
+import { formatDateTime, formatDuration, shortId } from '../../utils/format.js'
 import { cancelMessage, canCancel, isCancelling, JOB_STATUSES } from './jobConstants.js'
 import { SubmitJobModal } from './SubmitJobModal.jsx'
 
 const PAGE_SIZE = 20
+
+function jobDuration(job) {
+  if (!job.startedAt || !job.completedAt) return '—'
+  const ms = new Date(job.completedAt).getTime() - new Date(job.startedAt).getTime()
+  return ms >= 0 ? formatDuration(ms) : '—'
+}
 
 /** When the job will run or ran: scheduled time for future work, else started/created. */
 const timingLabel = (job) => {
@@ -33,6 +40,7 @@ export function JobsPage() {
   const status = params.get('status') ?? ''
   const [searchInput, setSearchInput] = useDebouncedUrlValue(search, (value) => update({ search: value, page: 1 }))
   const [submitting, setSubmitting] = useState(false)
+  const [confirmCancel, setConfirmCancel] = useState(null)
   const [busyId, setBusyId] = useState(null)
 
   const queue = useApiQuery(`queue:${queueId}`, (signal) => queuesApi.get(queueId, { signal }))
@@ -56,16 +64,12 @@ export function JobsPage() {
   useLiveRefresh((e) => e.type === 'queue' && e.id === queueId, queue.refresh)
 
   const cancel = async (job) => {
-    const running = job.status === 'ACTIVE'
-    const prompt = running
-      ? `Ask the running job "${job.name}" to stop? It is cancelled once its handler returns.`
-      : `Cancel job "${job.name}"? It will not run.`
-    if (!window.confirm(prompt)) return
     setBusyId(job.id)
     try {
       const res = await jobsApi.cancel(job.id)
       jobs.setData((rows) => rows.map((j) => (j.id === res.data.id ? res.data : j)))
       toast.success(cancelMessage(res.data))
+      setConfirmCancel(null)
     } catch (err) {
       toast.error(err.message)
       if (err.status === 409) jobs.reload()
@@ -146,6 +150,20 @@ export function JobsPage() {
             </option>
           ))}
         </select>
+        {filtered && (
+          <button
+            type="button"
+            className="button button-ghost button-small"
+            onClick={() => update({ search: '', status: '', page: 1 })}
+          >
+            Clear filters
+          </button>
+        )}
+        {jobs.meta && !jobs.loading && (
+          <span className="toolbar-meta">
+            {jobs.meta.total} job{jobs.meta.total === 1 ? '' : 's'}
+          </span>
+        )}
       </div>
 
       {jobs.error ? (
@@ -192,6 +210,7 @@ export function JobsPage() {
                   <th scope="col" className="num">
                     Priority
                   </th>
+                  <th scope="col">Duration</th>
                   <th scope="col">Timing</th>
                   <th scope="col">
                     <span className="sr-only">Actions</span>
@@ -215,6 +234,7 @@ export function JobsPage() {
                       {job.attemptsMade} / {job.maxAttempts}
                     </td>
                     <td className="num">{job.priority}</td>
+                    <td className="mono cell-sub">{jobDuration(job)}</td>
                     <td className="cell-sub">{timingLabel(job)}</td>
                     <td className="actions">
                       {canCancel(job) && (
@@ -223,7 +243,7 @@ export function JobsPage() {
                           className="button button-small"
                           disabled={busyId === job.id}
                           aria-label={`Cancel ${job.name} ${shortId(job.id)}`}
-                          onClick={() => cancel(job)}
+                          onClick={() => setConfirmCancel(job)}
                         >
                           Cancel
                         </button>
@@ -239,6 +259,38 @@ export function JobsPage() {
           </div>
           <Pagination meta={jobs.meta} onPageChange={(p) => update({ page: p })} />
         </>
+      )}
+
+      {confirmCancel && (
+        <Modal
+          title={confirmCancel.status === 'ACTIVE' ? 'Request job cancellation?' : 'Cancel job?'}
+          onClose={() => setConfirmCancel(null)}
+          footer={
+            <>
+              <button type="button" className="button" onClick={() => setConfirmCancel(null)}>
+                Keep job
+              </button>
+              <button
+                type="button"
+                className="button button-danger"
+                disabled={busyId === confirmCancel.id}
+                onClick={() => cancel(confirmCancel)}
+              >
+                {busyId === confirmCancel.id
+                  ? 'Cancelling…'
+                  : confirmCancel.status === 'ACTIVE'
+                    ? 'Request cancel'
+                    : 'Cancel job'}
+              </button>
+            </>
+          }
+        >
+          <p>
+            {confirmCancel.status === 'ACTIVE'
+              ? `Ask the running job "${confirmCancel.name}" to stop? It will be cancelled once its handler returns.`
+              : `Cancel job "${confirmCancel.name}"? It will not run.`}
+          </p>
+        </Modal>
       )}
 
       {submitting && q && <SubmitJobModal queue={q} onClose={() => setSubmitting(false)} onSubmitted={onSubmitted} />}

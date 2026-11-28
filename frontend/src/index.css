@@ -1350,3 +1350,116 @@ fieldset.field legend {
     align-items: flex-start;
   }
 }
+
+/* ---------- Step 4: Jobs, Submit Modal & Job Detail ---------- */
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.45rem;
+}
+.preset-chip {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 0.14s ease, color 0.14s ease, background-color 0.14s ease;
+}
+.preset-chip:hover,
+.preset-chip.active {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--info-bg);
+}
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.3rem;
+}
+.field-label-row label {
+  font-weight: 500;
+}
+
+.job-id-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+  flex-wrap: wrap;
+}
+.code-block-wrap {
+  position: relative;
+}
+.code-copy-btn {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  z-index: 2;
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+}
+.error-stack {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.78rem;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.lifecycle-track {
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 1.75rem;
+}
+.lifecycle-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+.lifecycle-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  margin-top: 0.32rem;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.lifecycle-primary .lifecycle-dot {
+  background: var(--primary);
+  box-shadow: 0 0 0 3px var(--info-bg);
+}
+.lifecycle-success .lifecycle-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-bg);
+}
+.lifecycle-warning .lifecycle-dot {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px var(--warning-bg);
+}
+.lifecycle-danger .lifecycle-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-bg);
+}
+.lifecycle-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.lifecycle-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+}

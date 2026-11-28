@@ -5,6 +5,12 @@ import { Field } from '../../components/ui.jsx'
 import { BUILTIN_HANDLERS } from './jobConstants.js'
 import { buildSubmitPayload, EMPTY_FORM, SERVER_FIELD } from './submitJobForm.js'
 
+const PRESET_PAYLOADS = {
+  'system.echo': '{\n  "message": "Hello from QueueForge"\n}',
+  'system.sleep': '{\n  "ms": 2000\n}',
+  'system.fail': '{\n  "message": "Simulated failure"\n}',
+}
+
 /** Submits a job to `queue`; calls onSubmitted with the persisted job. */
 export function SubmitJobModal({ queue, onClose, onSubmitted }) {
   const [values, setValues] = useState(EMPTY_FORM)
@@ -13,6 +19,25 @@ export function SubmitJobModal({ queue, onClose, onSubmitted }) {
   const [saving, setSaving] = useState(false)
   const set = (key) => (e) => setValues((v) => ({ ...v, [key]: e.target.value }))
   const defaults = queue.defaultJobOptions ?? {}
+
+  const applyPreset = (handler) => {
+    setValues((v) => ({
+      ...v,
+      name: handler,
+      payload: PRESET_PAYLOADS[handler] ?? v.payload,
+    }))
+    setErrors((e) => ({ ...e, name: undefined, payload: undefined }))
+  }
+
+  const formatPayload = () => {
+    try {
+      const parsed = JSON.parse(values.payload || '{}')
+      setValues((v) => ({ ...v, payload: JSON.stringify(parsed, null, 2) }))
+      setErrors((e) => ({ ...e, payload: undefined }))
+    } catch {
+      setErrors((e) => ({ ...e, payload: 'Payload must be valid JSON' }))
+    }
+  }
 
   const submit = async (event) => {
     event.preventDefault()
@@ -63,14 +88,40 @@ export function SubmitJobModal({ queue, onClose, onSubmitted }) {
       )}
       <form id="submit-job-form" onSubmit={submit} noValidate>
         <Field label="Job name" htmlFor="job-name" error={errors.name} hint="The registered handler that runs this job.">
-          <input id="job-name" list="job-handlers" value={values.name} onChange={set('name')} autoComplete="off" />
+          <input
+            id="job-name"
+            list="job-handlers"
+            autoFocus
+            value={values.name}
+            onChange={set('name')}
+            autoComplete="off"
+          />
           <datalist id="job-handlers">
             {BUILTIN_HANDLERS.map((h) => (
               <option key={h} value={h} />
             ))}
           </datalist>
+          <div className="preset-row" aria-label="Built-in handler presets">
+            <span className="cell-sub">Presets:</span>
+            {BUILTIN_HANDLERS.map((h) => (
+              <button
+                key={h}
+                type="button"
+                className={`preset-chip${values.name === h ? ' active' : ''}`}
+                onClick={() => applyPreset(h)}
+              >
+                {h}
+              </button>
+            ))}
+          </div>
         </Field>
-        <Field label="Payload (JSON object)" htmlFor="job-payload" error={errors.payload}>
+        <div className="field-label-row">
+          <label htmlFor="job-payload">Payload (JSON object)</label>
+          <button type="button" className="button button-ghost button-small" onClick={formatPayload}>
+            Format JSON
+          </button>
+        </div>
+        <div className={`field${errors.payload ? ' field-invalid' : ''}`}>
           <textarea
             id="job-payload"
             className="code-input"
@@ -79,7 +130,12 @@ export function SubmitJobModal({ queue, onClose, onSubmitted }) {
             value={values.payload}
             onChange={set('payload')}
           />
-        </Field>
+          {errors.payload && (
+            <p className="field-error" id="job-payload-error">
+              {errors.payload}
+            </p>
+          )}
+        </div>
 
         <fieldset className="field">
           <legend>When</legend>
