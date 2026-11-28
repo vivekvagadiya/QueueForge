@@ -1,4 +1,5 @@
 import { useEffect, useEffectEvent, useRef } from 'react'
+import { usePreferences } from '../theme/PreferencesContext.jsx'
 import { useRealtime } from './RealtimeProvider.jsx'
 
 /**
@@ -8,11 +9,13 @@ import { useRealtime } from './RealtimeProvider.jsx'
  */
 export function useLiveRefresh(match, refresh, { delayMs = 300 } = {}) {
   const { subscribe } = useRealtime()
+  const { liveRefreshEnabled } = usePreferences()
   const timer = useRef(null)
   const matches = useEffectEvent((event) => match(event))
   const run = useEffectEvent(() => refresh())
 
   useEffect(() => {
+    if (!liveRefreshEnabled) return undefined
     const schedule = () => {
       clearTimeout(timer.current)
       timer.current = setTimeout(run, delayMs)
@@ -24,5 +27,5 @@ export function useLiveRefresh(match, refresh, { delayMs = 300 } = {}) {
       unsubscribe()
       clearTimeout(timer.current)
     }
-  }, [subscribe, delayMs])
+  }, [subscribe, delayMs, liveRefreshEnabled])
 }

@@ -1,4 +1,4 @@
-import { apiRequest } from './client.js'
+import { API_BASE_URL, apiRequest } from './client.js'
 
 export const authApi = {
   login: (credentials) => apiRequest('/auth/login', { method: 'POST', body: credentials, auth: false }),
@@ -29,4 +29,29 @@ export const jobsApi = {
 export const workersApi = {
   /** `{ page, limit, status }` → `{ data, meta: { ..., statusCounts } }` */
   list: (query, options) => apiRequest('/workers', { query, ...options }),
+}
+
+export const dashboardApi = {
+  /** Read-only aggregate summary for the Overview Dashboard. */
+  get: (options) => apiRequest('/dashboard', options),
+}
+
+export const healthApi = {
+  /**
+   * Readiness probe (`GET /health/ready`).
+   * Parses 503 responses as well so the System Health page can display
+   * per-dependency check details when critical checks are down.
+   */
+  async ready(options = {}) {
+    const res = await fetch(`${API_BASE_URL}/health/ready`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: options.signal,
+    })
+    const body = await res.json().catch(() => null)
+    if (!body || !body.data) {
+      throw new Error(`Health check failed with status ${res.status}`)
+    }
+    return { statusCode: res.status, data: body.data }
+  },
 }
