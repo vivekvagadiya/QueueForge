@@ -4,7 +4,7 @@ import { useLiveRefresh } from '../realtime/useLiveRefresh.js'
 import { EmptyState, ErrorState, Pagination, Spinner, StatusBadge } from '../components/ui.jsx'
 import { useApiQuery } from '../hooks/useApiQuery.js'
 import { useUrlParams } from '../hooks/useUrlParams.js'
-import { formatAge, formatDateTime } from '../utils/format.js'
+import { formatAge, formatDateTime, shortId } from '../utils/format.js'
 
 const PAGE_SIZE = 20
 const AGE_TICK_MS = 5000
@@ -20,16 +20,32 @@ const STATUS_HELP = {
 
 function Capacity({ active, total }) {
   const pct = total > 0 ? Math.min(100, Math.round((active / total) * 100)) : 0
+  const tone = pct >= 90 ? 'capacity-high' : pct >= 60 ? 'capacity-mid' : ''
   return (
-    <div className="capacity" title={`${active} of ${total} slots in use`}>
+    <div className="capacity" title={`${active} of ${total} slots in use (${pct}%)`}>
       <span className="num">
         {active} / {total}
       </span>
-      <span className="capacity-bar" aria-hidden="true">
+      <span className={`capacity-bar ${tone}`} aria-hidden="true">
         <span style={{ width: `${pct}%` }} />
       </span>
     </div>
   )
+}
+
+function workerActivityState(w) {
+  if (w.status === 'STOPPED') return { label: 'Offline', cls: 'neutral' }
+  if (w.status === 'UNHEALTHY') return { label: 'Unhealthy', cls: 'danger' }
+  if (w.status === 'DRAINING') return { label: 'Draining', cls: 'warning' }
+  if (w.status === 'STARTING') return { label: 'Starting', cls: 'warning' }
+  return w.activeJobs > 0 ? { label: 'Busy', cls: 'primary' } : { label: 'Idle', cls: 'success' }
+}
+
+function heartbeatTone(ageMs, status) {
+  if (status === 'STOPPED') return 'neutral'
+  if (status === 'UNHEALTHY' || ageMs === null || ageMs > 45_000) return 'danger'
+  if (ageMs > 15_000) return 'warning'
+  return 'success'
 }
 
 const queuesLabel = (w) => {
@@ -71,6 +87,26 @@ export function WorkersPage() {
           Refresh
         </button>
       </div>
+
+      {workers.meta && (
+        <div className="worker-summary-pills" aria-label="Cluster worker summary">
+          <span className="summary-pill">
+            <span className="dot dot-success" aria-hidden="true" />
+            Running: <strong>{counts.RUNNING ?? 0}</strong>
+          </span>
+          <span className="summary-pill">
+            <span className="dot dot-warning" aria-hidden="true" />
+            Draining: <strong>{counts.DRAINING ?? 0}</strong>
+          </span>
+          <span className="summary-pill">
+            <span className="dot dot-danger" aria-hidden="true" />
+            Unhealthy: <strong>{counts.UNHEALTHY ?? 0}</strong>
+          </span>
+          <span className="summary-pill">
+            Total: <strong>{totalAll}</strong>
+          </span>
+        </div>
+      )}
 
       <div className="toolbar">
         <div className="segmented" role="group" aria-label="Filter by status">
@@ -132,32 +168,47 @@ export function WorkersPage() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((w) => (
-                  <tr key={w.id}>
-                    <td>
-                      <div className="cell-title">{w.name}</div>
-                      <div className="cell-sub mono">
-                        {w.hostname} · pid {w.processId}
-                      </div>
-                    </td>
-                    <td>
-                      <span title={STATUS_HELP[w.status]}>
-                        <StatusBadge status={w.status} />
-                      </span>
-                    </td>
-                    <td>
-                      <Capacity active={w.status === 'STOPPED' ? 0 : w.activeJobs} total={w.concurrency} />
-                    </td>
-                    <td title={w.lastHeartbeatAt ? new Date(w.lastHeartbeatAt).toLocaleString() : undefined}>
-                      {w.status === 'STOPPED' ? '—' : formatAge(heartbeatAge(w))}
-                    </td>
-                    <td className="cell-sub">{queuesLabel(w)}</td>
-                    <td className="cell-sub">
-                      {formatDateTime(w.startedAt)}
-                      {w.stoppedAt && <div>Stopped {formatDateTime(w.stoppedAt)}</div>}
-                    </td>
-                  </tr>
-                ))}
+                {rows.map((w) => {
+                  const age = heartbeatAge(w)
+                  const hbTone = heartbeatTone(age, w.status)
+                  const activity = workerActivityState(w)
+                  return (
+                    <tr key={w.id}>
+                      <td>
+                        <div className="cell-title">{w.name}</div>
+                        <div className="cell-sub mono" title={w.id}>
+                          {shortId(w.id)} · {w.hostname} · pid {w.processId}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="worker-status-cell">
+                          <span title={STATUS_HELP[w.status]}>
+                            <StatusBadge status={w.status} />
+                          </span>
+                          <span className={`activity-tag activity-${activity.cls}`}>{activity.label}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <Capacity active={w.status === 'STOPPED' ? 0 : w.activeJobs} total={w.concurrency} />
+                      </td>
+                      <td title={w.lastHeartbeatAt ? new Date(w.lastHeartbeatAt).toLocaleString() : undefined}>
+                        {w.status === 'STOPPED' ? (
+                          '—'
+                        ) : (
+                          <span className="heartbeat-cell">
+                            <span className={`dot dot-${hbTone}`} aria-hidden="true" />
+                            <span>{formatAge(age)}</span>
+                          </span>
+                        )}
+                      </td>
+                      <td className="cell-sub">{queuesLabel(w)}</td>
+                      <td className="cell-sub">
+                        {formatDateTime(w.startedAt)}
+                        {w.stoppedAt && <div>Stopped {formatDateTime(w.stoppedAt)}</div>}
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

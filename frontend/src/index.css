@@ -1463,3 +1463,95 @@ fieldset.field legend {
   font-weight: 600;
   font-size: 0.9rem;
 }
+
+/* ---------- Step 5: Workers & Responsive Polish ---------- */
+.worker-summary-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.9rem;
+}
+.summary-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.summary-pill strong {
+  color: var(--text);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.dot-success {
+  background: var(--success);
+}
+.dot-warning {
+  background: var(--warning);
+}
+.dot-danger {
+  background: var(--danger);
+}
+.worker-status-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.activity-tag {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--radius-sm);
+  background: var(--neutral-bg);
+  color: var(--muted);
+}
+.activity-primary {
+  background: var(--info-bg);
+  color: var(--primary);
+}
+.activity-success {
+  background: var(--success-bg);
+  color: var(--success);
+}
+.activity-warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+.activity-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.heartbeat-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.capacity-bar.capacity-mid span {
+  background: var(--warning);
+}
+.capacity-bar.capacity-high span {
+  background: var(--danger);
+}
+
+@media (max-width: 760px) {
+  .segmented {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .segmented button {
+    flex: 1 1 auto;
+  }
+  .table-wrap {
+    -webkit-overflow-scrolling: touch;
+  }
+}

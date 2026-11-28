@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { useRealtime } from '../realtime/RealtimeProvider.jsx'
@@ -140,6 +140,15 @@ export function Layout() {
   const { pathname } = useLocation()
   const [navOpen, setNavOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
+
+  useEffect(() => {
+    if (!navOpen) return undefined
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') setNavOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [navOpen])
 
   const pageTitle = getPageTitle(pathname)
 
