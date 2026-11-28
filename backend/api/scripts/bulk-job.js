@@ -3,7 +3,7 @@ const BASE_URL = "http://localhost:8080/api/v1"; // Docker frontend proxy (ya ht
 const EMAIL = "vivek1@yopmail.com";
 const PASSWORD = "Test@123";
 const QUEUE_NAME = "3f908a79-2708-42c8-bb47-b6a76c5fdb5e"; // Ya neeche QUEUE_ID directly set karein
-const COUNT = 20; // Kitne jobs create karne hain (100, 200, etc.)
+const COUNT = 150; // Kitne jobs create karne hain (100, 200, etc.)
 const CONCURRENCY = 2; // Ek saath kitni API requests bhejni hain
 
 async function request(path, { method = "GET", token, body } = {}) {
