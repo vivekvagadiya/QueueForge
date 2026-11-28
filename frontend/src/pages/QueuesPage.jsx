@@ -140,9 +140,14 @@ export function QueuesPage() {
           <h1>Queues</h1>
           <p className="muted">Create queues, tune their limits, and pause or resume dispatch.</p>
         </div>
-        <button type="button" className="button button-primary" onClick={() => setModal({})}>
-          New queue
-        </button>
+        <div className="header-actions">
+          <button type="button" className="button" onClick={reload} disabled={loading}>
+            Refresh
+          </button>
+          <button type="button" className="button button-primary" onClick={() => setModal({})}>
+            New queue
+          </button>
+        </div>
       </div>
 
       <div className="toolbar">
@@ -167,6 +172,11 @@ export function QueuesPage() {
             </button>
           ))}
         </div>
+        {meta && !loading && (
+          <span className="toolbar-meta">
+            {meta.total} queue{meta.total === 1 ? '' : 's'}
+          </span>
+        )}
       </div>
 
       {error ? (

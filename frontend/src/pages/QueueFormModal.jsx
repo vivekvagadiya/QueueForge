@@ -65,10 +65,22 @@ export function QueueFormModal({ queue, onClose, onSaved }) {
       )}
       <form id="queue-form" onSubmit={submit} noValidate>
         <Field label="Name" htmlFor="name" error={errors.name}>
-          <input id="name" value={values.name} onChange={set('name')} aria-describedby={describedBy('name')} />
+          <input
+            id="name"
+            autoFocus={!editing}
+            value={values.name}
+            onChange={set('name')}
+            aria-describedby={describedBy('name')}
+          />
         </Field>
         <Field label="Description" htmlFor="description" error={errors.description}>
-          <textarea id="description" rows={2} value={values.description} onChange={set('description')} />
+          <textarea
+            id="description"
+            rows={2}
+            value={values.description}
+            onChange={set('description')}
+            aria-describedby={describedBy('description')}
+          />
         </Field>
         <Field
           label="Concurrency"
@@ -76,14 +88,32 @@ export function QueueFormModal({ queue, onClose, onSaved }) {
           error={errors.concurrency}
           hint="Most jobs of this queue that may run at once, across all workers."
         >
-          <input id="concurrency" inputMode="numeric" value={values.concurrency} onChange={set('concurrency')} />
+          <input
+            id="concurrency"
+            inputMode="numeric"
+            value={values.concurrency}
+            onChange={set('concurrency')}
+            aria-describedby={describedBy('concurrency')}
+          />
         </Field>
         <div className="field-row">
           <Field label="Default max attempts" htmlFor="maxAttempts" error={errors.maxAttempts} hint="Blank = 3">
-            <input id="maxAttempts" inputMode="numeric" value={values.maxAttempts} onChange={set('maxAttempts')} />
+            <input
+              id="maxAttempts"
+              inputMode="numeric"
+              value={values.maxAttempts}
+              onChange={set('maxAttempts')}
+              aria-describedby={describedBy('maxAttempts')}
+            />
           </Field>
           <Field label="Default priority" htmlFor="priority" error={errors.priority} hint="Blank = 0">
-            <input id="priority" inputMode="numeric" value={values.priority} onChange={set('priority')} />
+            <input
+              id="priority"
+              inputMode="numeric"
+              value={values.priority}
+              onChange={set('priority')}
+              aria-describedby={describedBy('priority')}
+            />
           </Field>
         </div>
         {editing && (
@@ -93,7 +123,12 @@ export function QueueFormModal({ queue, onClose, onSaved }) {
             error={errors.status}
             hint="Paused queues accept jobs but run none. Archived queues reject new jobs."
           >
-            <select id="status" value={values.status} onChange={set('status')}>
+            <select
+              id="status"
+              value={values.status}
+              onChange={set('status')}
+              aria-describedby={describedBy('status')}
+            >
               <option value="ACTIVE">Active</option>
               <option value="PAUSED">Paused</option>
               <option value="ARCHIVED">Archived</option>
